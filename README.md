@@ -81,60 +81,66 @@ All benchmarks run on a modern multi-core system. Results show median time with 
 
 | Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
 |-----------|-----------|-----------------|-----------|
-| Pin/Unpin | 3.06 ns | 5.37 ns | **1.75x faster** |
+| Pin/Unpin | 1.63 ns | 5.57 ns | **3.42x faster** |
 
-SWMR-Epoch's simpler epoch model provides faster pin/unpin operations compared to Crossbeam's more complex implementation.
+SWMR-Epoch's simplified epoch model provides significantly faster pin/unpin operations, now over 3x faster than Crossbeam.
 
 #### 2. Reader Registration (Latency)
 
 | Thread Count | SWMR-Epoch | Crossbeam-Epoch | Ratio |
 |-------------|-----------|-----------------|-------|
-| 2 threads | 76.46 µs | 80.65 µs | **1.05x faster** |
-| 4 threads | 132.84 µs | 140.43 µs | **1.06x faster** |
-| 8 threads | 240.94 µs | 254.87 µs | **1.06x faster** |
-| 16 threads | 451.65 µs | 477.67 µs | **1.06x faster** |
+| 2 threads | 72.02 µs | 78.35 µs | **1.09x faster** |
+| 4 threads | 128.11 µs | 137.77 µs | **1.08x faster** |
+| 8 threads | 239.55 µs | 251.50 µs | **1.05x faster** |
+| 16 threads | 454.38 µs | 479.11 µs | **1.05x faster** |
 
-**Trade-off Analysis**: SWMR-Epoch uses a lock-free queue for pending registrations, which adds minimal overhead. At higher thread counts (8+), SWMR-Epoch matches or slightly outperforms Crossbeam due to better scalability of the registration mechanism.
+**Performance Improvements**:
+- 2-thread performance improved to 1.09x (from 1.05x)
+- 4-thread performance improved to 1.08x (from 1.06x)
+- Overall 2-3% performance gain across thread counts
 
 #### 3. Garbage Collection Performance
 
 | Operation | SWMR-Epoch | Crossbeam-Epoch | Ratio |
 |-----------|-----------|-----------------|-------|
-| Retire 100 items | 3.10 µs | 0.92 µs | **3.37x slower** |
-| Retire 1,000 items | 27.62 µs | 14.44 µs | **1.91x slower** |
-| Retire 10,000 items | 273.98 µs | 168.27 µs | **1.63x slower** |
+| Retire 100 items | 3.18 µs | 0.94 µs | **3.38x slower** |
+| Retire 1,000 items | 29.95 µs | 14.44 µs | **2.07x slower** |
+| Retire 10,000 items | 297.00 µs | 140.87 µs | **2.11x slower** |
 
-**Trade-off Analysis**: SWMR-Epoch's garbage collection is slower because:
-- It performs full participant list scans (O(N)) on each reclamation
-- Crossbeam uses more sophisticated data structures (e.g., thread-local bags)
-- SWMR-Epoch prioritizes simplicity and lock-free guarantees over GC throughput
+**Performance Notes**:
+- Small batch (100 items) performance remains stable
+- Large batch (10,000 items) performance gap slightly increased (from 1.63x to 2.11x)
 
-**Recommendation**: Use SWMR-Epoch when:
-- Read-heavy workloads dominate (GC is infrequent)
-- Latency predictability is critical
-- Lock-free guarantees are essential
+**Optimization Opportunities**:
+- Consider batching mechanisms for small object reclamation
+- Optimize large object reclamation path
 
 #### 4. Atomic Load Operations
 
 | Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
 |-----------|-----------|-----------------|-----------|
-| Load | 3.07 ns | 333.98 ns | **108.8x faster** |
+| Load | 1.63 ns | 306.63-412.44 ns | **188-253x faster** |
 
-SWMR-Epoch's atomic load is nearly 100x faster because it performs a simple `Acquire` load without additional bookkeeping. Crossbeam's overhead comes from its more complex epoch tracking.
+**Significant Improvement**:
+- Atomic load performance improved by 73-133%, from 108x to 188-253x faster
+- Demonstrates SWMR-Epoch's absolute advantage in read performance
 
-#### 5. Concurrent Reads (Throughput) ⭐ **SWMR-Epoch Excels**
+#### 5. Concurrent Reads (Throughput) ⭐ **SWMR-Epoch Leads**
 
 | Thread Count | SWMR-Epoch | Crossbeam-Epoch | Speedup |
 |-------------|-----------|-----------------|---------|
-| 2 threads | 85.19 µs | 615.00 µs | **7.22x faster** |
-| 4 threads | 146.80 µs | 1,334.9 ms | **9.09x faster** |
-| 8 threads | 254.39 µs | 3,379.1 ms | **13.28x faster** |
+| 2 threads | 80.84 µs | 633.65 µs | **7.84x faster** |
+| 4 threads | 134.46 µs | 1.26 ms | **9.37x faster** |
+| 8 threads | 238.35 µs | 1.29 ms | **5.41x faster** |
 
-**Key Advantage**: SWMR-Epoch demonstrates exceptional performance under concurrent read workloads:
-- Linear scalability with thread count
-- Minimal contention on shared state
-- Lock-free design eliminates reader blocking
-- Simple epoch model reduces per-operation overhead
+**Key Findings**:
+- 3-7% performance improvement in 2-4 thread scenarios
+- Performance decrease in 8-thread scenario (from 13.28x to 5.41x)
+- Possible cause: Increased resource contention under high concurrency
+
+**Optimization Directions**:
+- Investigate 8-thread performance regression
+- Optimize resource contention in high-concurrency scenarios
 
 This is the primary strength of SWMR-Epoch—it's purpose-built for read-heavy concurrent workloads.
 
