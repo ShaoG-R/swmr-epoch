@@ -28,14 +28,14 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 - Manages garbage collection and deferred deletion
 - Maintains participant list for tracking active readers
 
-**ReaderFactory & ReaderHandle**
-- `ReaderFactory`: Clone-safe factory for creating reader handles
-- `ReaderHandle`: Per-thread reader handle with epoch pinning
-- `ReaderGuard`: RAII guard ensuring safe access during critical sections
+**ReaderRegistry**
+- `ReaderRegistry`: Clone-safe registry for managing thread-local reader state
+- `pin()`: Pins the current thread and returns a `Guard`
+- `Guard`: RAII guard ensuring safe access during critical sections
 
 **Atomic<T>**
 - Type-safe atomic pointer wrapper
-- Load operations require active `ReaderGuard`
+- Load operations require active `Guard`
 - Store operations trigger garbage collection
 
 ### Memory Ordering
@@ -50,16 +50,15 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 use swmr_epoch::{new, Atomic};
 
 fn main() {
-    let (mut writer, reader_factory) = new();
+    let (mut writer, reader_registry) = new();
     
     // Create an atomic pointer
     let data = Atomic::new(42i32);
     
     // Reader thread
-    let factory_clone = reader_factory.clone();
+    let registry_clone = reader_registry.clone();
     let reader_thread = std::thread::spawn(move || {
-        let handle = factory_clone.create_handle();
-        let guard = handle.pin();
+        let guard = registry_clone.pin();
         let value = data.load(&guard);
         println!("Read value: {}", value);
     });
@@ -82,7 +81,7 @@ All benchmarks run on a modern multi-core system. Results show median time with 
 
 | Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
 |-----------|-----------|-----------------|-----------|
-| Pin/Unpin | 3.42 ns | 6.21 ns | **1.82x faster** |
+| Pin/Unpin | 3.06 ns | 5.37 ns | **1.75x faster** |
 
 SWMR-Epoch's simpler epoch model provides faster pin/unpin operations compared to Crossbeam's more complex implementation.
 
@@ -90,10 +89,10 @@ SWMR-Epoch's simpler epoch model provides faster pin/unpin operations compared t
 
 | Thread Count | SWMR-Epoch | Crossbeam-Epoch | Ratio |
 |-------------|-----------|-----------------|-------|
-| 2 threads | 152.32 µs | 145.13 µs | 1.05x slower |
-| 4 threads | 228.35 µs | 230.32 µs | 0.99x (comparable) |
-| 8 threads | 395.54 µs | 394.71 µs | 1.00x (comparable) |
-| 16 threads | 708.79 µs | 724.51 µs | **0.98x faster** |
+| 2 threads | 76.46 µs | 80.65 µs | **1.05x faster** |
+| 4 threads | 132.84 µs | 140.43 µs | **1.06x faster** |
+| 8 threads | 240.94 µs | 254.87 µs | **1.06x faster** |
+| 16 threads | 451.65 µs | 477.67 µs | **1.06x faster** |
 
 **Trade-off Analysis**: SWMR-Epoch uses a lock-free queue for pending registrations, which adds minimal overhead. At higher thread counts (8+), SWMR-Epoch matches or slightly outperforms Crossbeam due to better scalability of the registration mechanism.
 
@@ -101,9 +100,9 @@ SWMR-Epoch's simpler epoch model provides faster pin/unpin operations compared t
 
 | Operation | SWMR-Epoch | Crossbeam-Epoch | Ratio |
 |-----------|-----------|-----------------|-------|
-| Retire 100 items | 5.40 µs | 2.04 µs | **2.65x slower** |
-| Retire 1,000 items | 50.18 µs | 38.27 µs | **1.31x slower** |
-| Retire 10,000 items | 567.37 µs | 227.83 µs | **2.49x slower** |
+| Retire 100 items | 3.10 µs | 0.92 µs | **3.37x slower** |
+| Retire 1,000 items | 27.62 µs | 14.44 µs | **1.91x slower** |
+| Retire 10,000 items | 273.98 µs | 168.27 µs | **1.63x slower** |
 
 **Trade-off Analysis**: SWMR-Epoch's garbage collection is slower because:
 - It performs full participant list scans (O(N)) on each reclamation
@@ -119,7 +118,7 @@ SWMR-Epoch's simpler epoch model provides faster pin/unpin operations compared t
 
 | Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
 |-----------|-----------|-----------------|-----------|
-| Load | 3.57 ns | 416.19 ns | **116.5x faster** |
+| Load | 3.07 ns | 333.98 ns | **108.8x faster** |
 
 SWMR-Epoch's atomic load is nearly 100x faster because it performs a simple `Acquire` load without additional bookkeeping. Crossbeam's overhead comes from its more complex epoch tracking.
 
@@ -127,9 +126,9 @@ SWMR-Epoch's atomic load is nearly 100x faster because it performs a simple `Acq
 
 | Thread Count | SWMR-Epoch | Crossbeam-Epoch | Speedup |
 |-------------|-----------|-----------------|---------|
-| 2 threads | 137.33 µs | 992.92 µs | **7.23x faster** |
-| 4 threads | 236.07 µs | 1,940.7 µs | **8.22x faster** |
-| 8 threads | 397.33 µs | 3,684.8 µs | **9.27x faster** |
+| 2 threads | 85.19 µs | 615.00 µs | **7.22x faster** |
+| 4 threads | 146.80 µs | 1,334.9 ms | **9.09x faster** |
+| 8 threads | 254.39 µs | 3,379.1 ms | **13.28x faster** |
 
 **Key Advantage**: SWMR-Epoch demonstrates exceptional performance under concurrent read workloads:
 - Linear scalability with thread count
