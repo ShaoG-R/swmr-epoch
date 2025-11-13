@@ -17,20 +17,18 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (mut writer, factory) = new();
-                    let factory = Arc::new(factory);
+                    let (mut writer, registry) = new();
+                    let registry = Arc::new(registry);
                     let atomic = Arc::new(Atomic::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let f = factory.clone();
+                            let r = registry.clone();
                             let a = atomic.clone();
                             
                             thread::spawn(move || {
-                                let handle = f.create_handle();
-                                
                                 for _ in 0..500 {
-                                    let guard = handle.pin();
+                                    let guard = r.pin();
                                     let _val = a.load(&guard);
                                 }
                             })
@@ -88,19 +86,18 @@ fn bench_scalability(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (_, factory) = new();
-                    let factory = Arc::new(factory);
+                    let (_, registry) = new();
+                    let registry = Arc::new(registry);
                     let atomic = Arc::new(Atomic::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let f = factory.clone();
+                            let r = registry.clone();
                             let a = atomic.clone();
                             
                             thread::spawn(move || {
-                                let handle = f.create_handle();
                                 for _ in 0..100 {
-                                    let guard = handle.pin();
+                                    let guard = r.pin();
                                     let _val = a.load(&guard);
                                 }
                             })
@@ -156,11 +153,10 @@ fn bench_gc_pressure(c: &mut Criterion) {
             num_retires,
             |b, &num_retires| {
                 b.iter(|| {
-                    let (mut writer, factory) = new();
-                    let handle = factory.create_handle();
+                    let (mut writer, registry) = new();
                     
                     for i in 0..num_retires {
-                        let _guard = handle.pin();
+                        let _guard = registry.pin();
                         writer.retire(Box::new(i as u64));
                     }
                     writer.try_reclaim();
@@ -193,11 +189,10 @@ fn bench_pin_latency(c: &mut Criterion) {
     group.sample_size(100);
     
     group.bench_function("swmr_epoch_pin_latency", |b| {
-        let (_, factory) = new();
-        let handle = factory.create_handle();
+        let (_, registry) = new();
         
         b.iter(|| {
-            let guard = handle.pin();
+            let guard = registry.pin();
             black_box(&guard);
             drop(guard);
         });
@@ -221,19 +216,18 @@ fn bench_high_contention(c: &mut Criterion) {
     
     group.bench_function("swmr_epoch_high_contention", |b| {
         b.iter(|| {
-            let (_, factory) = new();
-            let factory = Arc::new(factory);
+            let (_, registry) = new();
+            let registry = Arc::new(registry);
             let atomic = Arc::new(Atomic::new(0u64));
             
             let handles: Vec<_> = (0..16)
                 .map(|_| {
-                    let f = factory.clone();
+                    let r = registry.clone();
                     let a = atomic.clone();
                     
                     thread::spawn(move || {
-                        let handle = f.create_handle();
                         for _ in 0..1000 {
-                            let guard = handle.pin();
+                            let guard = r.pin();
                             let _val = a.load(&guard);
                         }
                     })

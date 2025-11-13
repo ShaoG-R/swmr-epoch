@@ -10,11 +10,10 @@ use swmr_epoch::{new, Atomic};
 // Benchmark 1: Single-threaded pin/unpin overhead
 fn bench_single_thread_pin_unpin(c: &mut Criterion) {
     c.bench_function("swmr_epoch_single_thread_pin_unpin", |b| {
-        let (_, factory) = new();
-        let handle = factory.create_handle();
+        let (_, registry) = new();
         
         b.iter(|| {
-            let _guard = handle.pin();
+            let _guard = registry.pin();
             black_box(());
         });
     });
@@ -37,14 +36,14 @@ fn bench_reader_registration(c: &mut Criterion) {
             num_readers,
             |b, &num_readers| {
                 b.iter(|| {
-                    let (_, factory) = new();
-                    let factory = Arc::new(factory);
+                    let (_, registry) = new();
+                    let registry = Arc::new(registry);
                     
                     let handles: Vec<_> = (0..num_readers)
                         .map(|_| {
-                            let f = factory.clone();
+                            let r = registry.clone();
                             thread::spawn(move || {
-                                f.create_handle()
+                                let _guard = r.pin();
                             })
                         })
                         .collect();
@@ -93,13 +92,12 @@ fn bench_garbage_collection(c: &mut Criterion) {
                     let mut total_duration = std::time::Duration::ZERO;
                     
                     for _ in 0..iters {
-                        let (mut writer, factory) = new();
-                        let handle = factory.create_handle();
+                        let (mut writer, registry) = new();
                         
                         let start = std::time::Instant::now();
                         
                         for i in 0..num_items {
-                            let _guard = handle.pin();
+                            let _guard = registry.pin();
                             writer.retire(Box::new(i as u64));
                         }
                         writer.try_reclaim();
@@ -146,12 +144,11 @@ fn bench_atomic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_operations");
     
     group.bench_function("swmr_epoch_load", |b| {
-        let (_, factory) = new();
-        let handle = factory.create_handle();
+        let (_, registry) = new();
         let atomic = Atomic::new(42u64);
         
         b.iter(|| {
-            let guard = handle.pin();
+            let guard = registry.pin();
             let val = atomic.load(&guard);
             black_box(val);
         });
@@ -181,21 +178,20 @@ fn bench_concurrent_reads(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (_, factory) = new();
-                    let factory = Arc::new(factory);
+                    let (_, registry) = new();
+                    let registry = Arc::new(registry);
                     let atomic = Arc::new(Atomic::new(0u64));
                     let counter = Arc::new(AtomicUsize::new(0));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let f = factory.clone();
+                            let r = registry.clone();
                             let a = atomic.clone();
                             let c = counter.clone();
                             
                             thread::spawn(move || {
-                                let handle = f.create_handle();
                                 for _ in 0..1000 {
-                                    let guard = handle.pin();
+                                    let guard = r.pin();
                                     let _val = a.load(&guard);
                                     c.fetch_add(1, Ordering::Relaxed);
                                 }

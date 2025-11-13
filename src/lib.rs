@@ -1,9 +1,13 @@
 use std::any::Any;
+use std::cell::Cell;
+// Used for the thread-local pin count
+// 用于线程本地的 pin 计数
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Weak;
 
 use crossbeam_queue::SegQueue;
-use std::sync::Weak;
+use thread_local::ThreadLocal;
 
 // Garbage collection trigger threshold
 // 垃圾回收的触发阈值
@@ -14,21 +18,14 @@ const RECLAIM_THRESHOLD: usize = 64;
 const INACTIVE_EPOCH: usize = usize::MAX;
 
 // Type-erased wrapper for a "retired" object
-// It knows how to drop itself
 // 一个被"退休"的对象的类型擦除包装
-// 它知道如何 drop 自己
 type ErasedGarbage = Box<dyn Any + Send>;
 
 // --- 1. Internal shared state ---
 // --- 1. 内部共享状态 ---
 
 /// Slot for each reader thread in the global table
-///
-/// The writer reads `active_epoch` to determine the safe reclamation point
-///
 /// 每个读取者线程在全局表格中对应的"槽位"
-/// 
-/// 写入者会读取 `active_epoch` 来决定安全回收点
 #[derive(Debug)]
 struct ParticipantSlot {
     // `usize::MAX` (INACTIVE_EPOCH) indicates inactive
@@ -45,53 +42,34 @@ struct SharedState {
     global_epoch: AtomicUsize,
 
     /// Lock-free queue for receiving registration requests from new readers
-    /// Readers push Arc<ParticipantSlot> into this queue
-    /// 一个无锁队列，用于接收新读取者的注册请求
-    /// 读取者将 Arc<ParticipantSlot> 放入这里
+    /// 用于接收新读取者注册请求的无锁队列
     pending_registrations: SegQueue<Arc<ParticipantSlot>>,
 }
 
 // --- 2. Writer ---
-// --- 2. 写入者 (Writer) ---
+// --- 2. 写入者 ---
 
 /// The unique writer handle
-///
-/// It is `!Clone` and `!Sync` to guarantee "single writer"
-///
 /// 唯一的写入者句柄
-/// 
-/// 它是 `!Clone` 和 `!Sync` 的，以保证"单写入者"
 pub struct Writer {
     shared: Arc<SharedState>,
     
-    /// Writer's private garbage bin.
-    /// Tuple: (epoch when retired, data to be dropped)
-    /// 写入者私有的垃圾桶。
-    /// 元组: (退休时的纪元, 要被drop的数据)
+    /// Writer's private garbage bin
+    /// 写入者私有的垃圾桶
     local_garbage: Vec<(usize, ErasedGarbage)>,
 
-    /// Participant list.
-    /// We store Weak pointers to automatically detect when Handle is dropped.
-    /// 参与者列表。
-    /// 我们存储 Weak 指针，以便自动检测 Handle 何时被 drop。
+    /// Participant list
+    /// 参与者列表
     participants: Vec<Weak<ParticipantSlot>>,
 }
 
 impl Writer {
     /// Retire (defer deletion) a pointer
-    ///
-    /// This method is generic and can accept any Box<T>
-    ///
     /// 退休（延迟删除）一个指针
-    ///
-    /// 这个方法是通用的，可以接受任何 Box<T>
     pub fn retire<T: Send + 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
-        
-        // Put into garbage bin
-        // 放入垃圾桶
         self.local_garbage.push((current_epoch, data));
-        
+
         if self.local_garbage.len() > RECLAIM_THRESHOLD {
             self.try_reclaim();
         }
@@ -105,11 +83,6 @@ impl Writer {
         let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
         let mut min_active_epoch = new_epoch;
-        
-        // Create a new Vec to hold participants for the next round
-        // We can pre-estimate capacity
-        // 创建一个新的 Vec 来存放下一轮的参与者
-        // 我们可以预估容量
         let mut new_participants = Vec::with_capacity(self.participants.len());
 
         // Step 2.A: Scan old participants (O(N))
@@ -122,8 +95,8 @@ impl Writer {
                 min_active_epoch = min_active_epoch.min(epoch);
                 new_participants.push(weak_slot.clone());
             }
-            // else: offline reader, don't push to new_participants, auto-remove
-            // else: 掉线的读取者，不 push 到 new_participants，自动移除
+            // else: offline reader, auto-remove
+            // else: 掉线的读取者，自动移除
         }
 
         // Step 2.B: Register all new readers (O(P))
@@ -133,11 +106,11 @@ impl Writer {
             min_active_epoch = min_active_epoch.min(epoch);
             new_participants.push(Arc::downgrade(&new_slot_arc));
         }
-        
+
         // Step 2.C: Replace old list
         // 步骤 2.C: 替换旧列表
         self.participants = new_participants;
-        
+
         // Step 3: Calculate safe reclamation point
         // 步骤 3: 计算安全回收点
         let safe_to_reclaim_epoch = min_active_epoch.saturating_sub(1);
@@ -149,114 +122,162 @@ impl Writer {
 }
 
 // --- 3. Reader ---
-// --- 3. 读取者 (Reader) ---
+// --- 3. 读取者 ---
 
-/// Cloneable reader factory
+/// Holds the thread-local state for a reader
+/// 持有读取者的线程本地状态
 ///
-/// `Clone`, `Send`, `Sync`.
-/// It can be wrapped in `Arc` and distributed to all new threads.
+/// Contains the participant slot and the reentrant pin count.
+/// 包含参与者槽位和可重入的 pin 计数。
+struct ThreadLocalParticipant {
+    /// This thread's participant slot
+    /// 此线程的参与者槽位
+    slot: Arc<ParticipantSlot>,
+    /// Reentrant pin count for this thread
+    /// 此线程的可重入 pin 计数
+    pin_count: Cell<usize>,
+}
+
+/// Cloneable reader registry
+/// 可克隆的读取者注册表
 ///
-/// 可克隆的读取者工厂
-///
-/// `Clone`, `Send`, `Sync`。
-/// 它可以被 `Arc` 并分发给所有新线程。
+/// This replaces ReaderFactory. It is Clone, Send, Sync.
+/// 它取代了 ReaderFactory。它是 Clone, Send, Sync。
+/// It can be shared across all threads.
+/// 可以在所有线程间共享。
+/// It manages the thread-local participant slots.
+/// 它管理线程本地的参与者槽位。
 #[derive(Clone)]
-pub struct ReaderFactory {
+pub struct ReaderRegistry {
     shared: Arc<SharedState>,
+    /// Thread-local storage for participant slots.
+    /// 用于参与者槽位的线程本地存储。
+    /// Each thread gets its own ThreadLocalParticipant.
+    /// 每个线程获得自己的 ThreadLocalParticipant。
+    local_participant: Arc<ThreadLocal<ThreadLocalParticipant>>,
 }
 
-/// Reader handle
-/// 读取者句柄
-pub struct ReaderHandle {
-    // It "owns" its own slot
-    // 它"拥有"自己的槽位
-    slot: Arc<ParticipantSlot>, 
-    shared: Arc<SharedState>,
-}
+impl ReaderRegistry {
+    /// Pins the current thread.
+    /// "钉住"当前线程。
+    ///
+    /// This method is reentrant. It returns a Guard that, when dropped,
+    /// will unpin the thread if it's the last remaining guard.
+    /// 此方法是可重入的。它返回一个 Guard，当 Guard 被 drop 时，
+    /// 如果这是最后一个 Guard，它将"解钉"线程。
+    pub fn pin(&self) -> Guard {
+        // Get or create the thread-local participant for this thread
+        // 获取或创建此线程的本地参与者
+        let participant = self.local_participant.get_or(|| {
+            // This closure runs only once per thread to initialize
+            // 这个闭包每个线程只在初始化时运行一次
+            let slot = Arc::new(ParticipantSlot {
+                active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
+            });
 
-impl ReaderFactory {
-    /// Create a new reader handle (lock-free operation)
-    /// 创建一个新的读取者句柄（无锁操作）
-    pub fn create_handle(&self) -> ReaderHandle {
-        let slot = Arc::new(ParticipantSlot {
-            active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
+            // Register this new slot with the writer
+            // 向写入者注册这个新槽位
+            self.shared.pending_registrations.push(slot.clone());
+
+            ThreadLocalParticipant {
+                slot,
+                pin_count: Cell::new(0),
+            }
         });
 
-        // Push the slot into the queue, waiting for Writer to register (lock-free)
-        // 将槽位推入队列，等待 Writer 注册（无锁）
-        self.shared.pending_registrations.push(slot.clone());
+        let pin_count = participant.pin_count.get();
+        if pin_count == 0 {
+            // This is the first pin on this thread. Mark as active.
+            // 这是此线程上的第一个 pin。标记为活跃。
+            // Use Acquire to see the new epoch from the Writer.
+            // 使用 Acquire 来观察写入者的新纪元。
+            let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
+            // Use Release to ensure this store is visible to the Writer.
+            // 使用 Release 来确保此存储对写入者可见。
+            participant
+                .slot
+                .active_epoch
+                .store(current_epoch, Ordering::Release);
+        }
 
-        // The returned Handle holds both slot and shared
-        // 返回的 Handle 同时持有 slot 和 shared
-        ReaderHandle {
-            slot,
-            shared: self.shared.clone(),
+        // Increment the reentrant pin count
+        // 增加可重入 pin 计数
+        participant.pin_count.set(pin_count + 1);
+
+        // Return a new guard pointing to the thread-local data
+        // 返回一个指向线程本地数据的 Guard
+        Guard {
+            local: participant as *const ThreadLocalParticipant,
         }
     }
 }
 
-impl ReaderHandle {
-    /// Pin the current thread and get a temporary `ReaderGuard`
-    ///
-    /// Lock-free operation
-    ///
-    /// As long as `ReaderGuard` exists, the writer cannot reclaim
-    /// any data retired in the current epoch or later.
-    ///
-    /// "钉住"当前线程，获取一个临时的 `ReaderGuard`
-    ///
-    /// 无锁操作
-    ///
-    /// 只要 `ReaderGuard` 存在，写入者就不能回收
-    /// 在当前纪元或之后被退休的任何数据。
-    pub fn pin(&self) -> ReaderGuard<'_> {
-        // Step 1: Read the current global epoch (lock-free)
-        // Use Acquire semantics to ensure we observe Writer's epoch advancement (fetch_add)
-        // and all memory operations before that epoch.
-        // 步骤 1: 读取当前全局纪元（无锁）
-        // 使用 Acquire 语义，确保我们能观察到 Writer 推进纪元 (fetch_add)
-        // 以及在该纪元之前的所有内存操作。
-        let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
-        
-        // Step 2: Mark our slot as "active in the current epoch" (lock-free)
-        // Use Release semantics to ensure any read operations before this store
-        // (such as the upcoming Atomic<T>::load)
-        // "happen-before" this marking.
-        // This prevents Writer (reading this value with Acquire) from incorrectly reclaiming
-        // data we are about to access.
-        // 步骤 2: 将自己的槽位标记为"活跃在当前纪元"（无锁）
-        // 使用 Release 语义，确保在此次 store 之前的任何读取操作
-        // (比如即将发生的 Atomic<T>::load)
-        // 都 "happen-before" 这个标记。
-        // 这能防止 Writer (使用 Acquire 读取此值) 错误地回收我们
-        // 即将访问的数据。
-        self.slot.active_epoch.store(current_epoch, Ordering::Release);
-        
-        // Step 3: Return the guard
-        // 步骤 3: 返回守卫
-        ReaderGuard { slot: &self.slot }
+/// A guard that keeps the current thread pinned.
+/// 一个保持当前线程被"钉住"的守卫。
+///
+/// This guard is !Send and !Sync because it references thread-local data.
+/// 此守卫是 !Send 和 !Sync 的，因为它引用了线程本地数据。
+/// It holds a raw pointer *const to the thread's ThreadLocalParticipant.
+/// 它持有一个指向线程的 ThreadLocalParticipant 的裸指针 *const。
+///
+/// Dropping the guard decrements the thread-local pin count and unpins
+/// the thread if the count reaches zero.
+/// Drop 此守卫会减少线程本地的 pin 计数，并在计数达到零时"解钉"线程。
+#[must_use]
+pub struct Guard {
+    local: *const ThreadLocalParticipant,
+}
+
+impl Clone for Guard {
+    /// Cloning a guard is a valid way to re-pin.
+    /// 克隆一个守卫是合法的重"钉" (re-pin) 方式。
+    /// This increments the thread-local pin count.
+    /// 这会增加线程本地的 pin 计数。
+    fn clone(&self) -> Self {
+        // SAFETY: local points to this thread's valid TLS data.
+        // SAFETY: local 指向此线程的有效 TLS 数据。
+        let participant = unsafe { &*self.local };
+        let pin_count = participant.pin_count.get();
+
+        // We must be in a pinned state to clone
+        // 克隆时必须处于"钉住"状态
+        assert!(pin_count > 0, "Cloning a guard in an unpinned state");
+
+        // Increment pin count
+        // 增加 pin 计数
+        participant.pin_count.set(pin_count + 1);
+
+        // Return a new guard pointing to the same data
+        // 返回一个指向相同数据的新守卫
+        Guard { local: self.local }
     }
 }
 
-/// Temporary reader guard
-///
-/// `!Send`, `!Sync`. It must be used on the stack of `pin()`.
-/// Its lifetime `'handle` guarantees it cannot outlive `ReaderHandle`.
-///
-/// 临时的读取者守卫
-///
-/// `!Send`, `!Sync`。它必须在 `pin()` 的栈上使用。
-/// 它的生命周期 `'handle` 保证了它不能活得比 `ReaderHandle` 更久。
-#[must_use]
-pub struct ReaderGuard<'handle> {
-    slot: &'handle ParticipantSlot,
-}
-
-impl<'handle> Drop for ReaderGuard<'handle> {
-    /// When `ReaderGuard` is destroyed, mark the thread as "inactive"
-    /// 当 `ReaderGuard` 被销毁时，标记线程为"不活跃"
+impl Drop for Guard {
     fn drop(&mut self) {
-        self.slot.active_epoch.store(INACTIVE_EPOCH, Ordering::Release);
+        // SAFETY: local points to this thread's valid TLS data.
+        // SAFETY: local 指向此线程的有效 TLS 数据。
+        let participant = unsafe { &*self.local };
+        let pin_count = participant.pin_count.get();
+
+        // We must be in a pinned state to drop
+        // Drop 时必须处于"钉住"状态
+        assert!(pin_count > 0, "Dropping a guard in an unpinned state");
+
+        if pin_count == 1 {
+            // This is the last guard. Mark the thread as inactive.
+            // 这是最后一个守卫。标记线程为不活跃。
+            // Use Release to ensure this is visible to the Writer.
+            // 使用 Release 确保这对写入者可见。
+            participant
+                .slot
+                .active_epoch
+                .store(INACTIVE_EPOCH, Ordering::Release);
+        }
+
+        // Decrement the reentrant pin count
+        // 减少可重入 pin 计数
+        participant.pin_count.set(pin_count - 1);
     }
 }
 
@@ -265,7 +286,10 @@ impl<'handle> Drop for ReaderGuard<'handle> {
 
 /// Create a new SWMR epoch system
 /// 创建一个新的 SWMR 纪元系统
-pub fn new() -> (Writer, ReaderFactory) {
+///
+/// Returns the Writer and the ReaderRegistry.
+/// 返回 Writer 和 ReaderRegistry。
+pub fn new() -> (Writer, ReaderRegistry) {
     let shared = Arc::new(SharedState {
         global_epoch: AtomicUsize::new(0),
         pending_registrations: SegQueue::new(),
@@ -277,11 +301,12 @@ pub fn new() -> (Writer, ReaderFactory) {
         local_garbage: Vec::new(),
     };
 
-    let factory = ReaderFactory {
+    let registry = ReaderRegistry {
         shared,
+        local_participant: Arc::new(ThreadLocal::new()),
     };
 
-    (writer, factory)
+    (writer, registry)
 }
 
 /// An epoch-protected atomic pointer
@@ -299,54 +324,36 @@ impl<T: Send + 'static> Atomic<T> {
         }
     }
 
-    /// Reader `load`
+    /// Reader load
+    /// 读取者 load
     ///
-    /// Must provide a `ReaderGuard`.
-    /// The lifetime of the returned reference `&T` is bound to the lifetime of `ReaderGuard`,
-    /// which guarantees at compile time that we won't use this reference outside the `Guard`.
-    ///
-    /// 读取者 `load`
-    ///
-    /// 必须提供一个 `ReaderGuard`。
-    /// 返回的引用 `&T` 的生命周期被绑定到 `ReaderGuard` 的生命周期，
-    /// 这在编译期保证了我们不会在 `Guard` 之外使用这个引用。
-    pub fn load<'guard>(&self, _guard: &'guard ReaderGuard) -> &'guard T {
+    /// Must provide a &Guard.
+    /// 必须提供一个 &Guard。
+    /// The lifetime of the returned reference &T is bound to the lifetime
+    /// of the Guard.
+    /// 返回的引用 &T 的生命周期被绑定到 Guard 的生命周期。
+    pub fn load<'guard>(&self, _guard: &'guard Guard) -> &'guard T {
         let ptr = self.ptr.load(Ordering::Acquire);
         // SAFETY:
-        // 1. `ptr` will never be null (because writer always maintains a valid pointer)
-        // 2. As long as `_guard` exists, `Writer` will not reclaim the memory pointed to by `ptr`
-        // 3. The returned reference `&'guard T` ensures this reference cannot be used outside the `Guard`
-        // SAFETY:
-        // 1. `ptr` 永远不会是 null (因为 writer 总是维护有效指针)
-        // 2. 只要 `_guard` 存在，`Writer` 就不会回收 `ptr` 指向的内存
-        // 3. 返回的引用 `&'guard T` 确保了在 `Guard` 之外无法使用此引用
+        // 1. ptr is always valid.
+        // 1. ptr 总是有效的。
+        // 2. The _guard guarantees the thread is pinned, so the
+        //    writer will not reclaim the data ptr points to.
+        // 2. _guard 保证了线程被"钉住"，所以写入者
+        //    不会回收 ptr 指向的数据。
+        // 3. The lifetime 'guard ensures the reference cannot outlive the pin.
+        // 3. 'guard 生命周期确保了引用不会比"钉"存活更久。
         unsafe { &*ptr }
     }
 
-    /// Writer `store`
-    ///
-    /// Must provide a `&mut Writer`.
-    /// This atomically replaces the pointer and gives the old pointer to `Writer` for retirement.
-    ///
-    /// 写入者 `store`
-    ///
-    /// 必须提供一个 `&mut Writer`。
-    /// 这会原子地替换指针，并将旧指针交给 `Writer` 退休。
+    /// Writer store
+    /// 写入者 store
     pub fn store(&self, data: Box<T>, writer: &mut Writer) {
         let new_ptr = Box::into_raw(data);
-        
-        // Atomically swap the pointer
-        // 原子地交换指针
         let old_ptr = self.ptr.swap(new_ptr, Ordering::Release);
 
         // Give the old pointer to GC
-        // SAFETY:
-        // `old_ptr` is created by `Box::into_raw`, which is valid.
-        // `writer` will ensure it is not freed before no readers reference it.
         // 将旧指针交给 GC
-        // SAFETY:
-        // `old_ptr` 是由 `Box::into_raw` 创建的，是有效的。
-        // `writer` 会确保在没有读取者引用它之前，不会释放它。
         if !old_ptr.is_null() {
             unsafe {
                 writer.retire(Box::from_raw(old_ptr));
@@ -358,8 +365,8 @@ impl<T: Send + 'static> Atomic<T> {
 impl<T> Drop for Atomic<T> {
     fn drop(&mut self) {
         // At `drop` time, we assume no other threads are accessing
-        // So we can safely take back and `drop` the final `Box`
         // 在 `drop` 时，我们假设没有其他线程在访问
+        // So we can safely take back and `drop` the final `Box`
         // 所以我们可以安全地拿回并 `drop` 最后的 `Box`
         let ptr = self.ptr.load(Ordering::Relaxed);
         if !ptr.is_null() {

@@ -9,22 +9,20 @@ use std::thread;
 /// 测试1: 单个写入者，多个读取者并发读取
 #[test]
 fn test_single_writer_multiple_readers_concurrent_reads() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
     
     let mut handles = vec![];
     
     // 创建 5 个读取者线程
     for _i in 0..5 {
-        let factory_clone = factory.clone();
+        let registry_clone = registry.clone();
         let atomic_clone = atomic.clone();
         
         let handle = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            
             // 每个读取者读取 10 次
             for _ in 0..10 {
-                let guard = reader_handle.pin();
+                let guard = registry_clone.pin();
                 let value = *atomic_clone.load(&guard);
                 assert!(value >= 0);
             }
@@ -42,16 +40,16 @@ fn test_single_writer_multiple_readers_concurrent_reads() {
 /// 测试2: 写入者更新，读取者观察
 #[test]
 fn test_writer_updates_readers_observe() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
     
-    let reader_handle = factory.create_handle();
+    let registry_clone = registry.clone();
     let atomic_clone = atomic.clone();
     
     let reader_thread = thread::spawn(move || {
         // 读取初始值
         {
-            let guard = reader_handle.pin();
+            let guard = registry_clone.pin();
             let value = *atomic_clone.load(&guard);
             assert_eq!(value, 0);
         }
@@ -61,7 +59,7 @@ fn test_writer_updates_readers_observe() {
         
         // 读取更新后的值
         {
-            let guard = reader_handle.pin();
+            let guard = registry_clone.pin();
             let value = *atomic_clone.load(&guard);
             assert_eq!(value, 100);
         }
@@ -77,29 +75,27 @@ fn test_writer_updates_readers_observe() {
 /// 测试3: 多个写入者模拟（通过 Arc<Mutex<Writer>>）
 #[test]
 fn test_sequential_writer_operations() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(1i32));
-    
-    let reader_handle = factory.create_handle();
     
     // 第一次写入
     atomic.store(Box::new(2), &mut writer);
     {
-        let guard = reader_handle.pin();
+        let guard = registry.pin();
         assert_eq!(*atomic.load(&guard), 2);
     }
     
     // 第二次写入
     atomic.store(Box::new(3), &mut writer);
     {
-        let guard = reader_handle.pin();
+        let guard = registry.pin();
         assert_eq!(*atomic.load(&guard), 3);
     }
     
     // 第三次写入
     atomic.store(Box::new(4), &mut writer);
     {
-        let guard = reader_handle.pin();
+        let guard = registry.pin();
         assert_eq!(*atomic.load(&guard), 4);
     }
 }
@@ -107,14 +103,14 @@ fn test_sequential_writer_operations() {
 /// 测试4: 读取者在不同纪元中的行为
 #[test]
 fn test_readers_in_different_epochs() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
     
-    let reader1 = factory.create_handle();
-    let reader2 = factory.create_handle();
+    // 创建两个不同的 registry 实例来模拟不同的读取者
+    let registry2 = registry.clone();
     
     // Reader 1 pin
-    let guard1 = reader1.pin();
+    let guard1 = registry.pin();
     {
         let value = *atomic.load(&guard1);
         assert_eq!(value, 0);
@@ -125,7 +121,7 @@ fn test_readers_in_different_epochs() {
     atomic.store(Box::new(10), &mut writer);
     
     // Reader 2 pin（在新纪元）
-    let guard2 = reader2.pin();
+    let guard2 = registry2.pin();
     {
         let value = *atomic.load(&guard2);
         assert_eq!(value, 10);
@@ -142,7 +138,7 @@ fn test_readers_in_different_epochs() {
 /// 测试5: 垃圾回收触发
 #[test]
 fn test_garbage_collection_trigger() {
-    let (mut writer, _factory) = new();
+    let (mut writer, _registry) = new();
     
     // 退休数据直到触发回收
     for i in 0..70 {
@@ -159,12 +155,10 @@ fn test_garbage_collection_trigger() {
 /// 测试6: 活跃读取者保护垃圾
 #[test]
 fn test_active_reader_protects_garbage() {
-    let (mut writer, factory) = new();
-    
-    let reader_handle = factory.create_handle();
+    let (mut writer, registry) = new();
     
     // 让读取者 pin，保持活跃
-    let _guard = reader_handle.pin();
+    let _guard = registry.pin();
     
     // 退休数据直到触发回收
     for i in 0..70 {
@@ -179,11 +173,10 @@ fn test_active_reader_protects_garbage() {
 /// 测试7: 读取者 drop 后垃圾被回收
 #[test]
 fn test_garbage_reclaimed_after_reader_drop() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     
     {
-        let reader_handle = factory.create_handle();
-        let _guard = reader_handle.pin();
+        let _guard = registry.pin();
         
         // 在读取者活跃时退休数据
         for i in 0..70 {
@@ -204,19 +197,19 @@ fn test_garbage_reclaimed_after_reader_drop() {
 /// 测试8: 多个读取者的最小纪元计算
 #[test]
 fn test_min_epoch_calculation_multiple_readers() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry1) = new();
     
-    let reader1 = factory.create_handle();
-    let reader2 = factory.create_handle();
+    // 创建第二个 registry 实例来模拟不同的读取者
+    let registry2 = registry1.clone();
     
     // Reader 1 在纪元 0
-    let _guard1 = reader1.pin();
+    let _guard1 = registry1.pin();
     
     // 推进纪元
     writer.try_reclaim();
     
     // Reader 2 在纪元 1
-    let _guard2 = reader2.pin();
+    let _guard2 = registry2.pin();
     
     // 退休一些数据
     writer.retire(Box::new(100i32));
@@ -228,25 +221,23 @@ fn test_min_epoch_calculation_multiple_readers() {
     assert!(writer.local_garbage.len() > 0);
 }
 
-/// 测试12: 大量并发读取
+/// 测试9: 大量并发读取
 #[test]
 fn test_high_concurrency_reads() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Arc::new(Atomic::new(42i32));
     
     let mut handles = vec![];
     
     // 创建 20 个读取者线程
     for _ in 0..20 {
-        let factory_clone = factory.clone();
+        let registry_clone = registry.clone();
         let atomic_clone = atomic.clone();
         
         let handle = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            
             // 每个读取者读取 100 次
             for _ in 0..100 {
-                let guard = reader_handle.pin();
+                let guard = registry_clone.pin();
                 let value = *atomic_clone.load(&guard);
                 assert_eq!(value, 42);
             }
@@ -261,20 +252,19 @@ fn test_high_concurrency_reads() {
     }
 }
 
-/// 测试13: 读取者线程退出后的清理
+/// 测试10: 读取者线程退出后的清理
 #[test]
 fn test_reader_thread_exit_cleanup() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     
     let counter = Arc::new(AtomicUsize::new(0));
     
     {
-        let factory_clone = factory.clone();
+        let registry_clone = registry.clone();
         let counter_clone = counter.clone();
         
         let _thread = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            let _guard = reader_handle.pin();
+            let _guard = registry_clone.pin();
             counter_clone.fetch_add(1, Ordering::SeqCst);
         });
         
@@ -289,13 +279,11 @@ fn test_reader_thread_exit_cleanup() {
     writer.try_reclaim();
 }
 
-/// 测试14: 交替的读写操作
+/// 测试11: 交替的读写操作
 #[test]
 fn test_interleaved_read_write_operations() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
-    
-    let reader_handle = factory.create_handle();
     
     for i in 0..10 {
         // 写入
@@ -303,19 +291,17 @@ fn test_interleaved_read_write_operations() {
         
         // 读取
         {
-            let guard = reader_handle.pin();
+            let guard = registry.pin();
             let value = *atomic.load(&guard);
             assert_eq!(value, i);
         }
     }
 }
 
-/// 测试15: 大量垃圾回收循环
+/// 测试12: 大量垃圾回收循环
 #[test]
 fn test_heavy_garbage_collection_cycles() {
-    let (mut writer, factory) = new();
-    
-    let reader_handle = factory.create_handle();
+    let (mut writer, registry) = new();
     
     for cycle in 0..10 {
         // 在每个循环中退休大量数据
@@ -327,6 +313,6 @@ fn test_heavy_garbage_collection_cycles() {
         writer.try_reclaim();
         
         // 读取者仍然活跃
-        let _guard = reader_handle.pin();
+        let _guard = registry.pin();
     }
 }

@@ -9,11 +9,10 @@ use std::thread;
 /// 测试1: 读取者 Guard 的生命周期约束
 #[test]
 fn test_guard_lifetime_constraint() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Atomic::new(42i32);
     
-    let handle = factory.create_handle();
-    let guard = handle.pin();
+    let guard = registry.pin();
     
     // 这个值的生命周期被绑定到 guard
     let value = atomic.load(&guard);
@@ -25,15 +24,13 @@ fn test_guard_lifetime_constraint() {
 /// 测试2: 多个 Guard 同时活跃
 #[test]
 fn test_multiple_guards_simultaneously_active() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Atomic::new(42i32);
     
-    let handle = factory.create_handle();
-    
-    let guard1 = handle.pin();
+    let guard1 = registry.pin();
     let value1 = atomic.load(&guard1);
     
-    let guard2 = handle.pin();
+    let guard2 = registry.pin();
     let value2 = atomic.load(&guard2);
     
     assert_eq!(*value1, 42);
@@ -43,18 +40,16 @@ fn test_multiple_guards_simultaneously_active() {
 /// 测试3: Guard 嵌套作用域
 #[test]
 fn test_guard_nested_scopes() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Atomic::new(42i32);
     
-    let handle = factory.create_handle();
-    
     {
-        let guard1 = handle.pin();
+        let guard1 = registry.pin();
         let value1 = atomic.load(&guard1);
         assert_eq!(*value1, 42);
         
         {
-            let guard2 = handle.pin();
+            let guard2 = registry.pin();
             let value2 = atomic.load(&guard2);
             assert_eq!(*value2, 42);
         }
@@ -68,31 +63,29 @@ fn test_guard_nested_scopes() {
 /// 测试4: 读取者在线程中的隔离
 #[test]
 fn test_reader_isolation_across_threads() {
-    let (_writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
     
+    // 创建并启动读取者线程
     let mut handles = vec![];
-    
-    for thread_id in 0..3 {
-        let factory_clone = factory.clone();
+    for _ in 0..3 {
+        let registry_clone = registry.clone();
         let atomic_clone = atomic.clone();
         
         let handle = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            
-            // 每个线程有自己的 guard
-            let guard = reader_handle.pin();
+            let guard = registry_clone.pin();
             let value = *atomic_clone.load(&guard);
-            
-            // 验证值正确
             assert_eq!(value, 0);
-            
-            thread_id
         });
         
         handles.push(handle);
     }
     
+    // 主线程作为写入者
+    thread::sleep(std::time::Duration::from_millis(10));
+    atomic.store(Box::new(1), &mut writer);
+    
+    // 等待所有读取者完成
     for handle in handles {
         handle.join().unwrap();
     }
@@ -113,9 +106,7 @@ fn test_writer_single_threaded_constraint() {
 /// 测试6: 垃圾回收的内存安全
 #[test]
 fn test_garbage_collection_memory_safety() {
-    let (mut writer, factory) = new();
-    
-    let reader = factory.create_handle();
+    let (mut writer, registry) = new();
     
     // 创建一些数据
     let data1 = Box::new(vec![1, 2, 3, 4, 5]);
@@ -126,13 +117,13 @@ fn test_garbage_collection_memory_safety() {
     writer.retire(data2);
     
     // 让读取者 pin
-    let _guard = reader.pin();
+    let _guard = registry.pin();
     
     // 触发回收（数据应该被保留）
     writer.try_reclaim();
     
     // 读取者仍然活跃
-    let _guard2 = reader.pin();
+    let _guard2 = registry.pin();
 }
 
 /// 测试7: Atomic 的 Drop 实现
@@ -149,15 +140,14 @@ fn test_atomic_drop_implementation() {
 /// 测试8: 多个 Atomic 实例的独立性
 #[test]
 fn test_multiple_atomic_independence() {
-    let (_writer, factory) = new();
-    let handle = factory.create_handle();
+    let (_writer, registry) = new();
     
     let atomic1 = Atomic::new(10i32);
     let atomic2 = Atomic::new(20i32);
     let atomic3 = Atomic::new(30i32);
     
     {
-        let guard = handle.pin();
+        let guard = registry.pin();
         
         let v1 = *atomic1.load(&guard);
         let v2 = *atomic2.load(&guard);
@@ -172,35 +162,27 @@ fn test_multiple_atomic_independence() {
 /// 测试9: 读取者工厂的克隆安全性
 #[test]
 fn test_reader_factory_clone_safety() {
-    let (_writer, factory) = new();
+    let (_writer, registry1) = new();
     
-    let factory1 = factory.clone();
-    let factory2 = factory.clone();
-    let factory3 = factory.clone();
+    // 克隆 registry 创建多个实例
+    let registry2 = registry1.clone();
+    let registry3 = registry1.clone();
     
-    let reader1 = factory.create_handle();
-    let reader2 = factory1.create_handle();
-    let reader3 = factory2.create_handle();
-    let reader4 = factory3.create_handle();
-    
-    // 所有读取者都应该能正常工作
-    let _g1 = reader1.pin();
-    let _g2 = reader2.pin();
-    let _g3 = reader3.pin();
-    let _g4 = reader4.pin();
+    // 所有 registry 实例都应该能正常工作
+    let _g1 = registry1.pin();
+    let _g2 = registry2.pin();
+    let _g3 = registry3.pin();
 }
 
 /// 测试10: 纪元推进的正确性
 #[test]
 fn test_epoch_advancement_correctness() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(0i32));
-    
-    let reader = factory.create_handle();
     
     // 初始纪元应该是 0
     {
-        let guard = reader.pin();
+        let guard = registry.pin();
         let value = *atomic.load(&guard);
         assert_eq!(value, 0);
     }
@@ -213,7 +195,7 @@ fn test_epoch_advancement_correctness() {
     
     // 读取应该看到新值
     {
-        let guard = reader.pin();
+        let guard = registry.pin();
         let value = *atomic.load(&guard);
         assert_eq!(value, 1);
     }
@@ -222,22 +204,20 @@ fn test_epoch_advancement_correctness() {
 /// 测试11: 并发读取的一致性
 #[test]
 fn test_concurrent_read_consistency() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Arc::new(Atomic::new(42i32));
     
     let mut handles = vec![];
     let consistency_check = Arc::new(AtomicUsize::new(0));
     
     for _ in 0..10 {
-        let factory_clone = factory.clone();
+        let registry_clone = registry.clone();
         let atomic_clone = atomic.clone();
         let check_clone = consistency_check.clone();
         
         let handle = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            
             for _ in 0..100 {
-                let guard = reader_handle.pin();
+                let guard = registry_clone.pin();
                 let value = *atomic_clone.load(&guard);
                 
                 if value == 42 {
@@ -260,17 +240,16 @@ fn test_concurrent_read_consistency() {
 /// 测试12: 读取者退出时的清理
 #[test]
 fn test_reader_exit_cleanup() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     
     let reader_count = Arc::new(AtomicUsize::new(0));
     
     {
-        let factory_clone = factory.clone();
+        let registry_clone = registry.clone();
         let count_clone = reader_count.clone();
         
         let _thread = thread::spawn(move || {
-            let reader_handle = factory_clone.create_handle();
-            let _guard = reader_handle.pin();
+            let _guard = registry_clone.pin();
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
         
@@ -309,8 +288,7 @@ fn test_complex_type_lifetime_management() {
         name: String,
     }
     
-    let (_writer, factory) = new();
-    let handle = factory.create_handle();
+    let (_writer, registry) = new();
     
     let data = ComplexData {
         id: 1,
@@ -321,7 +299,7 @@ fn test_complex_type_lifetime_management() {
     let atomic = Atomic::new(data);
     
     {
-        let guard = handle.pin();
+        let guard = registry.pin();
         let loaded = atomic.load(&guard);
         assert_eq!(loaded.id, 1);
         assert_eq!(loaded.values.len(), 5);
@@ -332,34 +310,34 @@ fn test_complex_type_lifetime_management() {
 /// 测试15: 读取者在不同纪元的数据可见性
 #[test]
 fn test_data_visibility_across_epochs() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry1) = new();
     let atomic = Arc::new(Atomic::new(0i32));
     
+    // 创建第二个 registry 实例来模拟不同的读取者
+    let registry2 = registry1.clone();
+    
     // Reader 1 在纪元 0
-    let reader1 = factory.create_handle();
-    let guard1 = reader1.pin();
+    let guard1 = registry1.pin();
     {
         let value = *atomic.load(&guard1);
         assert_eq!(value, 0);
     }
     
-    // 推进纪元并更新值
+    // Writer 推进纪元并更新
     writer.try_reclaim();
     atomic.store(Box::new(1), &mut writer);
     
     // Reader 2 在纪元 1
-    let reader2 = factory.create_handle();
-    let guard2 = reader2.pin();
+    let guard2 = registry2.pin();
     {
         let value = *atomic.load(&guard2);
         assert_eq!(value, 1);
     }
     
-    // Reader 1 仍然活跃，会看到最新的值
-    // 因为 Atomic 中存储的是指针，所有读取者看到的是同一个数据
-    let guard1_again = reader1.pin();
+    // Reader 1 现在也会看到新值，因为 Atomic 中的指针已经更新
+    // 纪元主要用于保护垃圾回收，而不是隔离数据可见性
     {
-        let value = *atomic.load(&guard1_again);
+        let value = *atomic.load(&guard1);
         assert_eq!(value, 1);
     }
 }
@@ -367,21 +345,19 @@ fn test_data_visibility_across_epochs() {
 /// 测试17: 读取者的快速切换
 #[test]
 fn test_rapid_reader_switching() {
-    let (_writer, factory) = new();
+    let (_writer, registry) = new();
     let atomic = Arc::new(Atomic::new(42i32));
-    
-    let handle = factory.create_handle();
     
     for _ in 0..100 {
         {
-            let guard = handle.pin();
+            let guard = registry.pin();
             let value = *atomic.load(&guard);
             assert_eq!(value, 42);
         }
         
         // 立即创建新的 guard
         {
-            let guard = handle.pin();
+            let guard = registry.pin();
             let value = *atomic.load(&guard);
             assert_eq!(value, 42);
         }
@@ -391,16 +367,16 @@ fn test_rapid_reader_switching() {
 /// 测试18: 写入者的垃圾管理
 #[test]
 fn test_writer_garbage_management() {
-    let (mut writer, factory) = new();
-    
-    let reader = factory.create_handle();
+    let (mut writer, registry) = new();
     
     // 第一轮：退休数据，读取者活跃
     {
-        let _guard = reader.pin();
+        let _guard = registry.pin();
         for i in 0..50 {
             writer.retire(Box::new(i as i32));
         }
+        
+        // 垃圾应该被保留
         assert!(writer.local_garbage.len() > 0);
     }
     
@@ -412,15 +388,15 @@ fn test_writer_garbage_management() {
 /// 测试19: 多个读取者的垃圾保护
 #[test]
 fn test_multiple_readers_garbage_protection() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry1) = new();
     
-    let reader1 = factory.create_handle();
-    let reader2 = factory.create_handle();
-    let reader3 = factory.create_handle();
+    // 创建多个 registry 实例来模拟不同的读取者
+    let registry2 = registry1.clone();
+    let registry3 = registry1.clone();
     
-    let _guard1 = reader1.pin();
-    let _guard2 = reader2.pin();
-    let _guard3 = reader3.pin();
+    let _guard1 = registry1.pin();
+    let _guard2 = registry2.pin();
+    let _guard3 = registry3.pin();
     
     // 退休数据
     for i in 0..100 {
@@ -434,21 +410,21 @@ fn test_multiple_readers_garbage_protection() {
 /// 测试20: 完整的生命周期场景
 #[test]
 fn test_complete_lifecycle_scenario() {
-    let (mut writer, factory) = new();
+    let (mut writer, registry) = new();
     let atomic = Arc::new(Atomic::new(String::from("initial")));
     
-    // 创建多个读取者
-    let readers: Vec<_> = (0..5).map(|_| factory.create_handle()).collect();
+    // 创建多个 registry 实例来模拟不同的读取者
+    let registries: Vec<_> = (0..5).map(|_| registry.clone()).collect();
     
     // 执行多轮操作
     for round in 0..3 {
         // 所有读取者 pin
-        let guards: Vec<_> = readers.iter().map(|r| r.pin()).collect();
+        let guards: Vec<_> = registries.iter().map(|r| r.pin()).collect();
         
         // 验证当前值
         for guard in &guards {
             let value = atomic.load(guard);
-            assert!(value.len() > 0);
+            assert!(!value.is_empty());
         }
         
         // 推进纪元
