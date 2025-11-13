@@ -19,7 +19,7 @@ const INACTIVE_EPOCH: usize = usize::MAX;
 
 // Type-erased wrapper for a "retired" object
 // 一个被"退休"的对象的类型擦除包装
-type ErasedGarbage = Box<dyn Any + Send>;
+type ErasedGarbage = Box<dyn Any>;
 
 // Thread-local storage for participant state
 // 线程本地的参与者状态存储
@@ -87,7 +87,7 @@ impl Writer {
 
     /// Retire (defer deletion) a pointer
     /// 退休（延迟删除）一个指针
-    pub fn retire<T: Send + 'static>(&mut self, data: Box<T>) {
+    pub fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
         
         // Get the garbage bag for the current epoch, or create a new one
@@ -386,7 +386,7 @@ pub struct Atomic<T> {
     ptr: AtomicPtr<T>,
 }
 
-impl<T: Send + 'static> Atomic<T> {
+impl<T: 'static> Atomic<T> {
     /// Create a new atomic pointer, initialized with the given data
     /// 创建一个新的原子指针，初始化为给定的数据
     pub fn new(data: T) -> Self {

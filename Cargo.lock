@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "swmr-epoch"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
