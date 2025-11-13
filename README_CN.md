@@ -1,5 +1,12 @@
 # SWMR-Epoch: 无锁单写多读纪元式垃圾回收系统
 
+[![Crates.io](https://img.shields.io/crates/v/swmr-epoch.svg)](https://crates.io/crates/swmr-epoch)
+[![License](https://img.shields.io/crates/l/swmr-epoch.svg)](https://github.com/ShaoG-R/swmr-epoch#license)
+[![Docs.rs](https://docs.rs/swmr-epoch/badge.svg)](https://docs.rs/swmr-epoch)
+[![GitHub](https://img.shields.io/badge/github-ShaoG--R/swmr--epoch-blue.svg)](https://github.com/ShaoG-R/swmr-epoch)
+
+[English Documentation](./README.md)
+
 一个高性能的无锁垃圾回收系统，实现单写多读（SWMR）纪元式内存回收机制。专为需要安全、高效内存管理的并发数据结构设计。
 
 ## 特性
