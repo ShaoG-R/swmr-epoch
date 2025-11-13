@@ -95,14 +95,14 @@ fn test_writer_try_reclaim() {
     // 验证垃圾被添加到本地垃圾桶
     // With BTreeMap, we check the total garbage count across all epochs
     // 使用 BTreeMap，我们检查所有 epoch 中的垃圾总数
-    let total_garbage: usize = writer.local_garbage.values().map(|v| v.len()).sum();
+    let total_garbage: usize = writer.local_garbage_count;
     assert_eq!(total_garbage, 2);
     
     // 手动触发回收
     writer.try_reclaim();
     
     // 回收后，垃圾桶应该被清空（因为没有活跃的读取者）
-    let total_garbage_after: usize = writer.local_garbage.values().map(|v| v.len()).sum();
+    let total_garbage_after: usize = writer.local_garbage_count;
     assert_eq!(total_garbage_after, 0);
 }
 

@@ -68,6 +68,10 @@ pub struct Writer {
     /// 键：纪元，值：该纪元的垃圾列表
     local_garbage: BTreeMap<usize, Vec<ErasedGarbage>>,
 
+    /// Total count of all items in local_garbage across all epochs
+    /// local_garbage 中所有 epoch 的项的总数
+    local_garbage_count: usize,
+
     /// Participant list
     /// 参与者列表
     participants: Vec<Weak<ParticipantSlot>>,
@@ -78,24 +82,32 @@ impl Writer {
     /// 获取所有 epoch 中的垃圾总数
     #[inline]
     fn total_garbage_count(&self) -> usize {
-        self.local_garbage.values().map(|v| v.len()).sum()
+        self.local_garbage_count
     }
 
     /// Retire (defer deletion) a pointer
     /// 退休（延迟删除）一个指针
     pub fn retire<T: Send + 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
-        // Insert garbage into the epoch bucket
-        // 将垃圾插入到 epoch 桶中
+        
+        // Get the garbage bag for the current epoch, or create a new one
+        // O(log E) to find/create the entry, then O(1) amortized push
+        // 获取当前纪元的垃圾袋，如果不存在则创建一个
+        // O(log E) 查找/创建条目，然后 O(1) 摊销的 push
         self.local_garbage
             .entry(current_epoch)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(data);
 
-        // Check if total garbage exceeds threshold
-        // 检查垃圾总数是否超过阈值
-        if self.total_garbage_count() > RECLAIM_THRESHOLD {
-            self.try_reclaim();
+            // Increment the total count
+            // 增加总计数
+            self.local_garbage_count += 1;
+            // --- 添加结束 ---
+
+            // Check if total garbage exceeds threshold
+            // 检查垃圾总数是否超过阈值
+            if self.total_garbage_count() > RECLAIM_THRESHOLD {
+                self.try_reclaim();
         }
     }
 
@@ -120,9 +132,7 @@ impl Writer {
             if let Some(slot) = weak_slot.upgrade() {
                 // Reader is still active
                 // 读取者仍然活跃
-                // Use Relaxed: Writer is single-threaded, no synchronization needed
-                // 使用 Relaxed：Writer 是单线程的，不需要同步
-                let epoch = slot.active_epoch.load(Ordering::Relaxed);
+                let epoch = slot.active_epoch.load(Ordering::Acquire);
                 min_active_epoch = min_active_epoch.min(epoch);
                 new_participants.push(weak_slot.clone());
             }
@@ -133,9 +143,7 @@ impl Writer {
         // Step 2.B: Register all new readers (O(P))
         // 步骤 2.B: 注册所有新来的读取者 (O(P))
         while let Some(new_slot_arc) = self.shared.pending_registrations.pop() {
-            // Use Relaxed: Writer is single-threaded, no synchronization needed
-            // 使用 Relaxed：Writer 是单线程的，不需要同步
-            let epoch = new_slot_arc.active_epoch.load(Ordering::Relaxed);
+            let epoch = new_slot_arc.active_epoch.load(Ordering::Acquire);
             min_active_epoch = min_active_epoch.min(epoch);
             new_participants.push(Arc::downgrade(&new_slot_arc));
         }
@@ -148,13 +156,49 @@ impl Writer {
         // 步骤 3: 计算安全回收点
         let safe_to_reclaim_epoch = min_active_epoch.saturating_sub(1);
 
-        // Step 4: Release garbage
-        // 步骤 4: 释放垃圾
-        // With BTreeMap, we can efficiently remove all epochs <= safe_to_reclaim_epoch
-        // 使用 BTreeMap，我们可以高效地删除所有 epoch <= safe_to_reclaim_epoch
-        // This is O(log N) instead of O(N) for the entire garbage collection
-        // 这是 O(log N) 而不是整个垃圾回收的 O(N)
-        self.local_garbage.retain(|epoch, _| *epoch > safe_to_reclaim_epoch);
+        // Step 4: Release garbage (Optimized using BTreeMap::retain O(E))
+        // 步骤 4: 释放垃圾 (使用 BTreeMap::retain O(E) 优化)
+        
+        // We use `retain` (O(E) traversal) instead of `split_off` (O(log E) split).
+        // While `split_off` is algorithmically faster, `retain` modifies in-place
+        // and, critically, *avoids new allocations*.
+        // This prevents contention on the global allocator, which could otherwise
+        // slow down the *first* `pin()` operation on reader threads.
+        //
+        // 我们使用 `retain` (O(E) 遍历) 而不是 `split_off` (O(log E) 分裂)。
+        // 虽然 `split_off` 算法上更快，但 `retain` 是就地修改，
+        // 并且（关键地）*避免了新的内存分配*。
+        // 这防止了对全局分配器的争用，否则这种争用可能会拖慢
+        // 读取者线程的*首次* `pin()` 操作。
+
+        // We need a counter to track the total garbage we are *keeping*.
+        // 我们需要一个计数器来跟踪我们 *保留* 下来的垃圾总数。
+        let mut retained_count = 0;
+
+        // `BTreeMap::retain` iterates over all E entries.
+        // The closure returns `true` to keep an entry, or `false` to remove (and drop) it.
+        // `BTreeMap::retain` 会遍历所有 E 个条目。
+        // 闭包返回 true 则保留，返回 false 则删除（并 drop）。
+        self.local_garbage.retain(|&epoch, bag| {
+            if epoch > safe_to_reclaim_epoch {
+                // This epoch is > the safe point, so we *keep* (retain) it.
+                // Add its count to the items we are keeping.
+                // 这个纪元 > 安全点，我们需要 *保留* (retain) 它。
+                // 将其数量累加到保留计数中。
+                retained_count += bag.len(); 
+                
+                true // Return true to keep this entry
+            } else {
+                // This epoch is <= the safe point, so we *remove* (drop) it.
+                // 这个纪元 <= 安全点，我们可以 *删除* (drop) 它。
+                
+                false // Return false to remove and drop this entry (and its bag)
+            }
+        });
+
+        // Update the total garbage count to only include what we retained.
+        // 更新总垃圾计数，使其只包含我们保留下来的部分。
+        self.local_garbage_count = retained_count;
     }
 }
 
@@ -331,6 +375,7 @@ pub fn new() -> (Writer, ReaderRegistry) {
         shared: shared.clone(),
         participants: Vec::new(),
         local_garbage: BTreeMap::new(),
+        local_garbage_count: 0,
     };
 
     let registry = ReaderRegistry {
