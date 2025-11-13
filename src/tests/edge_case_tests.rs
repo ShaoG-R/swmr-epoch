@@ -40,17 +40,13 @@ fn test_exactly_reach_reclaim_threshold() {
     }
     
     // 应该还没有自动回收
-    // With BTreeMap, we check the total garbage count across all epochs
-    // 使用 BTreeMap，我们检查所有 epoch 中的垃圾总数
-    let total_garbage: usize = writer.local_garbage.values().map(|v| v.len()).sum();
-    assert_eq!(total_garbage, 64);
+    assert_eq!(writer.local_garbage_count, 64);
     
     // 再退休一个，应该触发自动回收
     writer.retire(Box::new(64i32));
     
     // 回收后应该清空
-    let total_garbage_after: usize = writer.local_garbage.values().map(|v| v.len()).sum();
-    assert_eq!(total_garbage_after, 0);
+    assert_eq!(writer.local_garbage_count, 0);
 }
 
 /// 测试4: 超过回收阈值

@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 // Used for the thread-local pin count
 // 用于线程本地的 pin 计数
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -62,11 +62,15 @@ struct SharedState {
 pub struct Writer {
     shared: Arc<SharedState>,
     
-    /// Writer's private garbage bin, grouped by epoch
-    /// 写入者私有的垃圾桶，按 epoch 分组
-    /// Key: epoch, Value: list of garbage for that epoch
-    /// 键：纪元，值：该纪元的垃圾列表
-    local_garbage: BTreeMap<usize, Vec<ErasedGarbage>>,
+    /// Writer's private garbage bin
+    /// 写入者私有的垃圾桶
+    /// Each item is (epoch, garbage). Simple Vec for minimal overhead.
+    /// 每项是 (epoch, 垃圾)。简单 Vec 以最小化开销。
+    local_garbage: VecDeque<(usize, Vec<ErasedGarbage>)>,
+
+    /// Total count of all items in local_garbage across all epochs
+    /// local_garbage 中所有 epoch 的项的总数
+    local_garbage_count: usize,
 
     /// Participant list
     /// 参与者列表
@@ -78,22 +82,42 @@ impl Writer {
     /// 获取所有 epoch 中的垃圾总数
     #[inline]
     fn total_garbage_count(&self) -> usize {
-        self.local_garbage.values().map(|v| v.len()).sum()
+        self.local_garbage_count
     }
 
     /// Retire (defer deletion) a pointer
     /// 退休（延迟删除）一个指针
     pub fn retire<T: Send + 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
-        // Insert garbage into the epoch bucket
-        // 将垃圾插入到 epoch 桶中
-        self.local_garbage
-            .entry(current_epoch)
-            .or_insert_with(Vec::new)
-            .push(data);
+        
+        // Check the last garbage bag
+        // 检查最后一个垃圾袋
+        if let Some((epoch, bag)) = self.local_garbage.back_mut() {
+            if *epoch == current_epoch {
+                // Same epoch, add to this bag
+                // 纪元相同，加入到这个袋子
+                bag.push(data);
+            } else {
+                // Different epoch (means try_reclaim just happened)
+                // Create a new bag
+                // 纪元不同 (说明 try_reclaim 刚发生过)
+                // 创建一个新的袋子
+                self.local_garbage.push_back((current_epoch, vec![data]));
+            }
+        } else {
+            // Entire queue is empty
+            // 整个队列是空的
+            self.local_garbage.push_back((current_epoch, vec![data]));
+        }
+
+        // Increment the total count
+        // 增加总计数
+        self.local_garbage_count += 1;
 
         // Check if total garbage exceeds threshold
         // 检查垃圾总数是否超过阈值
+        // Note: could be changed to dynamic threshold, e.g., self.participants.len().max(128) * 2
+        // (注意：这里可以改为动态阈值，例如 self.participants.len().max(128) * 2)
         if self.total_garbage_count() > RECLAIM_THRESHOLD {
             self.try_reclaim();
         }
@@ -104,12 +128,7 @@ impl Writer {
     pub fn try_reclaim(&mut self) {
         // Step 1: Advance global epoch
         // 步骤 1: 推进全局纪元
-        // Use Release instead of SeqCst: Writer is single-threaded, only needs Release
-        // for readers to see the new epoch. SeqCst is overkill and causes unnecessary
-        // global synchronization.
-        // 使用 Release 而非 SeqCst：Writer 是单线程的，只需要 Release
-        // 让读取者看到新纪元。SeqCst 过度强化且会导致不必要的全局同步。
-        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Release) + 1;
+        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
 
         let mut min_active_epoch = new_epoch;
         let mut new_participants = Vec::with_capacity(self.participants.len());
@@ -122,7 +141,7 @@ impl Writer {
                 // 读取者仍然活跃
                 // Use Relaxed: Writer is single-threaded, no synchronization needed
                 // 使用 Relaxed：Writer 是单线程的，不需要同步
-                let epoch = slot.active_epoch.load(Ordering::Relaxed);
+                let epoch = slot.active_epoch.load(Ordering::Acquire);
                 min_active_epoch = min_active_epoch.min(epoch);
                 new_participants.push(weak_slot.clone());
             }
@@ -148,13 +167,32 @@ impl Writer {
         // 步骤 3: 计算安全回收点
         let safe_to_reclaim_epoch = min_active_epoch.saturating_sub(1);
 
-        // Step 4: Release garbage
-        // 步骤 4: 释放垃圾
-        // With BTreeMap, we can efficiently remove all epochs <= safe_to_reclaim_epoch
-        // 使用 BTreeMap，我们可以高效地删除所有 epoch <= safe_to_reclaim_epoch
-        // This is O(log N) instead of O(N) for the entire garbage collection
-        // 这是 O(log N) 而不是整个垃圾回收的 O(N)
-        self.local_garbage.retain(|epoch, _| *epoch > safe_to_reclaim_epoch);
+        // Step 4: Release garbage (optimized with VecDeque O(E_safe))
+        // 步骤 4: 释放垃圾 (使用 VecDeque O(E_safe) 优化)
+        
+        let mut reclaimed_count = 0;
+        
+        // Start checking from queue front (oldest epoch)
+        // 从队列头部 (最老的纪元) 开始检查
+        while let Some((epoch, bag)) = self.local_garbage.front() {
+            if *epoch <= safe_to_reclaim_epoch {
+                // This epoch bag can be safely reclaimed
+                // 这个纪元袋可以安全回收
+                reclaimed_count += bag.len();
+                
+                // pop_front() removes and returns the bag, which is dropped here
+                // pop_front() 会移除并返回袋子，袋子在此处被 drop
+                self.local_garbage.pop_front(); 
+            } else {
+                // Encountered first non-reclaimable epoch, stop
+                // 遇到第一个不能回收的纪元，停止
+                break;
+            }
+        }
+
+        // Update total count
+        // 更新总计数
+        self.local_garbage_count -= reclaimed_count;
     }
 }
 
@@ -329,8 +367,9 @@ pub fn new() -> (Writer, ReaderRegistry) {
 
     let writer = Writer {
         shared: shared.clone(),
+        local_garbage: VecDeque::new(),
+        local_garbage_count: 0,
         participants: Vec::new(),
-        local_garbage: BTreeMap::new(),
     };
 
     let registry = ReaderRegistry {
