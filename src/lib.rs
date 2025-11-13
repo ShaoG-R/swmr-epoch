@@ -1,5 +1,6 @@
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
+use std::collections::BTreeMap;
 // Used for the thread-local pin count
 // 用于线程本地的 pin 计数
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -7,7 +8,6 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use crossbeam_queue::SegQueue;
-use thread_local::ThreadLocal;
 
 // Garbage collection trigger threshold
 // 垃圾回收的触发阈值
@@ -20,6 +20,14 @@ const INACTIVE_EPOCH: usize = usize::MAX;
 // Type-erased wrapper for a "retired" object
 // 一个被"退休"的对象的类型擦除包装
 type ErasedGarbage = Box<dyn Any + Send>;
+
+// Thread-local storage for participant state
+// 线程本地的参与者状态存储
+// Using UnsafeCell for zero-overhead access (safe because TLS is single-threaded)
+// 使用 UnsafeCell 以实现零开销访问（安全，因为 TLS 是单线程的）
+thread_local! {
+    static THREAD_LOCAL_PARTICIPANT: UnsafeCell<Option<ThreadLocalParticipant>> = UnsafeCell::new(None);
+}
 
 // --- 1. Internal shared state ---
 // --- 1. 内部共享状态 ---
@@ -54,9 +62,11 @@ struct SharedState {
 pub struct Writer {
     shared: Arc<SharedState>,
     
-    /// Writer's private garbage bin
-    /// 写入者私有的垃圾桶
-    local_garbage: Vec<(usize, ErasedGarbage)>,
+    /// Writer's private garbage bin, grouped by epoch
+    /// 写入者私有的垃圾桶，按 epoch 分组
+    /// Key: epoch, Value: list of garbage for that epoch
+    /// 键：纪元，值：该纪元的垃圾列表
+    local_garbage: BTreeMap<usize, Vec<ErasedGarbage>>,
 
     /// Participant list
     /// 参与者列表
@@ -64,13 +74,27 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// Get total garbage count across all epochs
+    /// 获取所有 epoch 中的垃圾总数
+    #[inline]
+    fn total_garbage_count(&self) -> usize {
+        self.local_garbage.values().map(|v| v.len()).sum()
+    }
+
     /// Retire (defer deletion) a pointer
     /// 退休（延迟删除）一个指针
     pub fn retire<T: Send + 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
-        self.local_garbage.push((current_epoch, data));
+        // Insert garbage into the epoch bucket
+        // 将垃圾插入到 epoch 桶中
+        self.local_garbage
+            .entry(current_epoch)
+            .or_insert_with(Vec::new)
+            .push(data);
 
-        if self.local_garbage.len() > RECLAIM_THRESHOLD {
+        // Check if total garbage exceeds threshold
+        // 检查垃圾总数是否超过阈值
+        if self.total_garbage_count() > RECLAIM_THRESHOLD {
             self.try_reclaim();
         }
     }
@@ -80,7 +104,12 @@ impl Writer {
     pub fn try_reclaim(&mut self) {
         // Step 1: Advance global epoch
         // 步骤 1: 推进全局纪元
-        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        // Use Release instead of SeqCst: Writer is single-threaded, only needs Release
+        // for readers to see the new epoch. SeqCst is overkill and causes unnecessary
+        // global synchronization.
+        // 使用 Release 而非 SeqCst：Writer 是单线程的，只需要 Release
+        // 让读取者看到新纪元。SeqCst 过度强化且会导致不必要的全局同步。
+        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Release) + 1;
 
         let mut min_active_epoch = new_epoch;
         let mut new_participants = Vec::with_capacity(self.participants.len());
@@ -91,7 +120,9 @@ impl Writer {
             if let Some(slot) = weak_slot.upgrade() {
                 // Reader is still active
                 // 读取者仍然活跃
-                let epoch = slot.active_epoch.load(Ordering::Acquire);
+                // Use Relaxed: Writer is single-threaded, no synchronization needed
+                // 使用 Relaxed：Writer 是单线程的，不需要同步
+                let epoch = slot.active_epoch.load(Ordering::Relaxed);
                 min_active_epoch = min_active_epoch.min(epoch);
                 new_participants.push(weak_slot.clone());
             }
@@ -102,7 +133,9 @@ impl Writer {
         // Step 2.B: Register all new readers (O(P))
         // 步骤 2.B: 注册所有新来的读取者 (O(P))
         while let Some(new_slot_arc) = self.shared.pending_registrations.pop() {
-            let epoch = new_slot_arc.active_epoch.load(Ordering::Acquire);
+            // Use Relaxed: Writer is single-threaded, no synchronization needed
+            // 使用 Relaxed：Writer 是单线程的，不需要同步
+            let epoch = new_slot_arc.active_epoch.load(Ordering::Relaxed);
             min_active_epoch = min_active_epoch.min(epoch);
             new_participants.push(Arc::downgrade(&new_slot_arc));
         }
@@ -117,7 +150,11 @@ impl Writer {
 
         // Step 4: Release garbage
         // 步骤 4: 释放垃圾
-        self.local_garbage.retain(|(epoch, _)| *epoch > safe_to_reclaim_epoch);
+        // With BTreeMap, we can efficiently remove all epochs <= safe_to_reclaim_epoch
+        // 使用 BTreeMap，我们可以高效地删除所有 epoch <= safe_to_reclaim_epoch
+        // This is O(log N) instead of O(N) for the entire garbage collection
+        // 这是 O(log N) 而不是整个垃圾回收的 O(N)
+        self.local_garbage.retain(|epoch, _| *epoch > safe_to_reclaim_epoch);
     }
 }
 
@@ -145,16 +182,11 @@ struct ThreadLocalParticipant {
 /// 它取代了 ReaderFactory。它是 Clone, Send, Sync。
 /// It can be shared across all threads.
 /// 可以在所有线程间共享。
-/// It manages the thread-local participant slots.
-/// 它管理线程本地的参与者槽位。
+/// Uses thread_local! macro for zero-overhead TLS access.
+/// 使用 thread_local! 宏实现零开销的 TLS 访问。
 #[derive(Clone)]
 pub struct ReaderRegistry {
     shared: Arc<SharedState>,
-    /// Thread-local storage for participant slots.
-    /// 用于参与者槽位的线程本地存储。
-    /// Each thread gets its own ThreadLocalParticipant.
-    /// 每个线程获得自己的 ThreadLocalParticipant。
-    local_participant: Arc<ThreadLocal<ThreadLocalParticipant>>,
 }
 
 impl ReaderRegistry {
@@ -166,49 +198,49 @@ impl ReaderRegistry {
     /// 此方法是可重入的。它返回一个 Guard，当 Guard 被 drop 时，
     /// 如果这是最后一个 Guard，它将"解钉"线程。
     pub fn pin(&self) -> Guard {
-        // Get or create the thread-local participant for this thread
-        // 获取或创建此线程的本地参与者
-        let participant = self.local_participant.get_or(|| {
-            // This closure runs only once per thread to initialize
-            // 这个闭包每个线程只在初始化时运行一次
-            let slot = Arc::new(ParticipantSlot {
-                active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
-            });
-
-            // Register this new slot with the writer
-            // 向写入者注册这个新槽位
-            self.shared.pending_registrations.push(slot.clone());
-
-            ThreadLocalParticipant {
-                slot,
-                pin_count: Cell::new(0),
+        THREAD_LOCAL_PARTICIPANT.with(|tls_cell| {
+            // SAFETY: We are in a single-threaded context (thread-local storage).
+            // No other thread can access this data.
+            // SAFETY: 我们在单线程上下文中（线程本地存储）。
+            // 没有其他线程可以访问此数据。
+            let participant_opt = unsafe { &mut *tls_cell.get() };
+            
+            // Initialize on first access
+            // 第一次访问时初始化
+            if participant_opt.is_none() {
+                let slot = Arc::new(ParticipantSlot {
+                    active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
+                });
+                self.shared.pending_registrations.push(slot.clone());
+                *participant_opt = Some(ThreadLocalParticipant {
+                    slot,
+                    pin_count: Cell::new(0),
+                });
             }
-        });
-
-        let pin_count = participant.pin_count.get();
-        if pin_count == 0 {
-            // This is the first pin on this thread. Mark as active.
-            // 这是此线程上的第一个 pin。标记为活跃。
-            // Use Acquire to see the new epoch from the Writer.
-            // 使用 Acquire 来观察写入者的新纪元。
-            let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
-            // Use Release to ensure this store is visible to the Writer.
-            // 使用 Release 来确保此存储对写入者可见。
-            participant
-                .slot
-                .active_epoch
-                .store(current_epoch, Ordering::Release);
-        }
-
-        // Increment the reentrant pin count
-        // 增加可重入 pin 计数
-        participant.pin_count.set(pin_count + 1);
-
-        // Return a new guard pointing to the thread-local data
-        // 返回一个指向线程本地数据的 Guard
-        Guard {
-            local: participant as *const ThreadLocalParticipant,
-        }
+            
+            let participant = participant_opt.as_ref().unwrap();
+            let pin_count = participant.pin_count.get();
+            
+            if pin_count == 0 {
+                // This is the first pin on this thread. Mark as active.
+                // 这是此线程上的第一个 pin。标记为活跃。
+                let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
+                participant
+                    .slot
+                    .active_epoch
+                    .store(current_epoch, Ordering::Release);
+            }
+            
+            // Increment the reentrant pin count
+            // 增加可重入 pin 计数
+            participant.pin_count.set(pin_count + 1);
+            
+            // Return a new guard pointing to the thread-local data
+            // 返回一个指向线程本地数据的 Guard
+            Guard {
+                local: participant as *const ThreadLocalParticipant,
+            }
+        })
     }
 }
 
@@ -298,12 +330,11 @@ pub fn new() -> (Writer, ReaderRegistry) {
     let writer = Writer {
         shared: shared.clone(),
         participants: Vec::new(),
-        local_garbage: Vec::new(),
+        local_garbage: BTreeMap::new(),
     };
 
     let registry = ReaderRegistry {
         shared,
-        local_participant: Arc::new(ThreadLocal::new()),
     };
 
     (writer, registry)

@@ -93,13 +93,17 @@ fn test_writer_try_reclaim() {
     writer.retire(Box::new(200i32));
     
     // 验证垃圾被添加到本地垃圾桶
-    assert_eq!(writer.local_garbage.len(), 2);
+    // With BTreeMap, we check the total garbage count across all epochs
+    // 使用 BTreeMap，我们检查所有 epoch 中的垃圾总数
+    let total_garbage: usize = writer.local_garbage.values().map(|v| v.len()).sum();
+    assert_eq!(total_garbage, 2);
     
     // 手动触发回收
     writer.try_reclaim();
     
     // 回收后，垃圾桶应该被清空（因为没有活跃的读取者）
-    assert_eq!(writer.local_garbage.len(), 0);
+    let total_garbage_after: usize = writer.local_garbage.values().map(|v| v.len()).sum();
+    assert_eq!(total_garbage_after, 0);
 }
 
 /// 测试7: 多个读取者
