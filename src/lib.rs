@@ -1,9 +1,9 @@
-use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 // Used for the thread-local pin count
 // 用于线程本地的 pin 计数
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -19,7 +19,43 @@ const INACTIVE_EPOCH: usize = usize::MAX;
 
 // Type-erased wrapper for a "retired" object
 // 一个被"退休"的对象的类型擦除包装
-type ErasedGarbage = Box<dyn Any>;
+type ErasedGarbage = Garbage;
+
+struct Garbage {
+    ptr: *mut (),
+    dtor: unsafe fn(*mut ()),
+}
+
+#[inline(always)]
+unsafe fn drop_value<T>(ptr: *mut ()) {
+    let ptr = ptr as *mut T;
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+impl Garbage {
+    #[inline(always)]
+    fn new<T: 'static>(value: Box<T>) -> Self {
+        let ptr = Box::into_raw(value) as *mut ();
+        Garbage {
+            ptr,
+            dtor: drop_value::<T>,
+        }
+    }
+}
+
+impl Drop for Garbage {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                (self.dtor)(self.ptr);
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
 
 // Thread-local storage for participant state
 // 线程本地的参与者状态存储
@@ -97,7 +133,7 @@ impl Writer {
         self.local_garbage
             .entry(current_epoch)
             .or_default()
-            .push(data);
+            .push(Garbage::new(data));
 
             // Increment the total count
             // 增加总计数
@@ -389,6 +425,7 @@ pub struct Atomic<T> {
 impl<T: 'static> Atomic<T> {
     /// Create a new atomic pointer, initialized with the given data
     /// 创建一个新的原子指针，初始化为给定的数据
+    #[inline]
     pub fn new(data: T) -> Self {
         Self {
             ptr: AtomicPtr::new(Box::into_raw(Box::new(data))),
@@ -403,6 +440,7 @@ impl<T: 'static> Atomic<T> {
     /// The lifetime of the returned reference &T is bound to the lifetime
     /// of the Guard.
     /// 返回的引用 &T 的生命周期被绑定到 Guard 的生命周期。
+    #[inline]
     pub fn load<'guard>(&self, _guard: &'guard Guard) -> &'guard T {
         let ptr = self.ptr.load(Ordering::Acquire);
         // SAFETY:
@@ -419,7 +457,7 @@ impl<T: 'static> Atomic<T> {
 
     /// Writer store
     /// 写入者 store
-    pub fn store(&self, data: Box<T>, writer: &mut Writer) {
+        pub fn store(&self, data: Box<T>, writer: &mut Writer) {
         let new_ptr = Box::into_raw(data);
         let old_ptr = self.ptr.swap(new_ptr, Ordering::Release);
 
@@ -434,6 +472,7 @@ impl<T: 'static> Atomic<T> {
 }
 
 impl<T> Drop for Atomic<T> {
+    #[inline]
     fn drop(&mut self) {
         // At `drop` time, we assume no other threads are accessing
         // 在 `drop` 时，我们假设没有其他线程在访问
