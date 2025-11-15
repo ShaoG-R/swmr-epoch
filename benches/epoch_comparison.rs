@@ -10,7 +10,7 @@ use swmr_epoch::{EpochGcDomain, EpochPtr};
 // Benchmark 1: Single-threaded pin/unpin overhead
 fn bench_single_thread_pin_unpin(c: &mut Criterion) {
     c.bench_function("swmr_epoch_single_thread_pin_unpin", |b| {
-        let domain = EpochGcDomain::new();
+        let (_gc, domain) = EpochGcDomain::new();
         let local_epoch = domain.register_reader();
         
         b.iter(|| {
@@ -37,8 +37,7 @@ fn bench_reader_registration(c: &mut Criterion) {
             num_readers,
             |b, &num_readers| {
                 b.iter(|| {
-                    let domain = EpochGcDomain::new();
-                    let domain = Arc::new(domain);
+                    let (_gc, domain) = EpochGcDomain::new();
                     
                     let handles: Vec<_> = (0..num_readers)
                         .map(|_| {
@@ -86,7 +85,7 @@ fn bench_atomic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_operations");
     
     group.bench_function("swmr_epoch_load", |b| {
-        let domain = EpochGcDomain::new();
+        let (_gc, domain) = EpochGcDomain::new();
         let local_epoch = domain.register_reader();
         let epoch_ptr = EpochPtr::new(42u64);
         
@@ -121,7 +120,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let domain = EpochGcDomain::new();
+                    let (_gc, domain) = EpochGcDomain::new();
                     let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     let counter = Arc::new(AtomicUsize::new(0));
                     

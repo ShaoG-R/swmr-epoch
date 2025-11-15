@@ -6,10 +6,8 @@ use crate::{EpochGcDomain, EpochPtr};
 /// 测试1: 创建 GcHandle 和 LocalEpoch
 #[test]
 fn test_create_gc_handle_and_local_epoch() {
-    let domain = EpochGcDomain::new();
-    
     // 验证 GcHandle 被成功创建
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    let (_gc, domain) = EpochGcDomain::new();
     
     // 验证 LocalEpoch 被成功创建
     let local_epoch = domain.register_reader();
@@ -20,7 +18,7 @@ fn test_create_gc_handle_and_local_epoch() {
 /// 测试2: 创建单个读取者
 #[test]
 fn test_create_single_reader() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     
     // 验证可以成功注册和 pin
     let local_epoch = domain.register_reader();
@@ -31,7 +29,7 @@ fn test_create_single_reader() {
 /// 测试3: 读取者 pin/unpin 循环
 #[test]
 fn test_reader_pin_unpin_cycle() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     // 第一次 pin
@@ -52,7 +50,7 @@ fn test_reader_pin_unpin_cycle() {
 /// 测试4: 创建 EpochPtr<T> 并读取
 #[test]
 fn test_epoch_ptr_create_and_load() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(42i32);
@@ -65,8 +63,7 @@ fn test_epoch_ptr_create_and_load() {
 /// 测试5: Writer 存储新值
 #[test]
 fn test_writer_store() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    let (mut gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(10i32);
@@ -92,8 +89,7 @@ fn test_writer_store() {
 /// 测试6: Writer 回收垃圾
 #[test]
 fn test_writer_collect() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+    let (mut gc, _domain) = EpochGcDomain::new();
     
     // 退休一些数据
     gc.retire(Box::new(100i32));
@@ -114,7 +110,7 @@ fn test_writer_collect() {
 /// 测试7: 嵌套 pin（可重入）
 #[test]
 fn test_nested_pins() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     // 验证可以创建多个嵌套 guard
@@ -131,7 +127,7 @@ fn test_nested_pins() {
 /// 测试8: 克隆 EpochGcDomain
 #[test]
 fn test_domain_clone() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     
     let domain_clone = domain.clone();
     
@@ -145,7 +141,7 @@ fn test_domain_clone() {
 /// 测试9: 字符串类型的 EpochPtr
 #[test]
 fn test_epoch_ptr_with_string() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(String::from("hello"));
@@ -166,7 +162,7 @@ fn test_epoch_ptr_with_struct() {
         y: i32,
     }
     
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(Point { x: 10, y: 20 });
@@ -190,7 +186,7 @@ fn test_epoch_ptr_drop() {
 /// 测试12: 多个 EpochPtr 实例
 #[test]
 fn test_multiple_epoch_ptr_instances() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr1 = EpochPtr::new(10i32);
@@ -208,7 +204,7 @@ fn test_multiple_epoch_ptr_instances() {
 /// 测试13: PinGuard 的克隆
 #[test]
 fn test_pin_guard_clone() {
-    let domain = EpochGcDomain::new();
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let guard1 = local_epoch.pin();
@@ -226,7 +222,7 @@ fn test_thread_safety() {
     use std::sync::Arc;
     use std::thread;
     
-    let domain = Arc::new(EpochGcDomain::new());
+    let (_gc, domain) = EpochGcDomain::new();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     // 创建多个线程同时读取

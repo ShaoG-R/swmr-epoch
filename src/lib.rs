@@ -102,48 +102,6 @@ struct SharedState {
     pending_registrations: SegQueue<Arc<ReaderSlot>>,
 }
 
-/// A builder for creating a `GcHandle` and transitioning the domain state.
-///
-/// This builder pattern ensures at compile-time that only one `GcHandle` can be
-/// created per `EpochGcDomain`. Use `into_parts()` to extract the handle and domain.
-///
-/// # Example
-///
-/// ```ignore
-/// let domain = EpochGcDomain::new();
-/// let (mut gc, domain) = domain.with_gc_handle().into_parts();
-/// ```
-///
-/// GcHandle 的 builder，用于创建 GcHandle 并转换域状态。
-/// 这个 builder 模式在编译时确保每个 `EpochGcDomain` 只能创建一个 `GcHandle`。
-/// 使用 `into_parts()` 来提取 handle 和 domain。
-pub struct GcHandleBuilder {
-    shared: Arc<SharedState>,
-    threshold: Option<usize>,
-}
-
-impl GcHandleBuilder {
-    /// Extract the `GcHandle` and the domain.
-    ///
-    /// 提取 `GcHandle` 和域。
-    #[inline]
-    pub fn into_parts(self) -> (GcHandle, EpochGcDomain) {
-        let gc = GcHandle {
-            shared: self.shared.clone(),
-            local_garbage: VecDeque::new(),
-            local_garbage_count: 0,
-            readers: Vec::new(),
-            auto_reclaim_threshold: self.threshold,
-        };
-
-        let domain_with_gc = EpochGcDomain {
-            shared: self.shared,
-        };
-
-        (gc, domain_with_gc)
-    }
-}
-
 /// The unique garbage collector handle for an epoch GC domain.
 ///
 /// There should be exactly one `GcHandle` per `EpochGcDomain`, owned by the writer thread.
@@ -387,71 +345,41 @@ pub struct EpochGcDomain {
 }
 
 impl EpochGcDomain {
-    /// Create a new epoch GC domain.
-    /// 创建一个新的 epoch GC 域。
+    /// Create a new epoch GC domain with default auto-reclaim threshold.
+    /// Returns both the GcHandle and the EpochGcDomain.
+    /// 创建一个新的 epoch GC 域，带有默认自动回收阈值。
+    /// 返回 GcHandle 和 EpochGcDomain。
     #[inline]
-    pub fn new() -> Self {
-        EpochGcDomain {
-            shared: Arc::new(SharedState {
-                global_epoch: AtomicUsize::new(0),
-                pending_registrations: SegQueue::new(),
-            }),
-        }
+    pub fn new() -> (GcHandle, Self) {
+        Self::new_with_threshold(Some(AUTO_RECLAIM_THRESHOLD))
     }
 
-    /// Start building a GC handle with default auto-reclaim threshold.
-    ///
-    /// This method consumes `self` and returns a builder that can be used to
-    /// create the unique `GcHandle`. This ensures at compile-time that only one
-    /// `GcHandle` can be created per domain.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let domain = EpochGcDomain::new();
-    /// let (mut gc, domain) = domain.with_gc_handle()?.into_parts();
-    /// ```
-    ///
-    /// 开始构建具有默认自动回收阈值的 GC handle。
-    /// 此方法消费 `self` 并返回一个 builder，可用于创建唯一的 `GcHandle`。
-    /// 这在编译时确保每个域只能创建一个 `GcHandle`。
+    /// Create a new epoch GC domain with a custom auto-reclaim threshold.
+    /// Returns both the GcHandle and the EpochGcDomain.
+    /// 创建一个新的 epoch GC 域，带有自定义自动回收阈值。
+    /// 返回 GcHandle 和 EpochGcDomain。
     #[inline]
-    pub fn with_gc_handle(self) -> GcHandleBuilder {
-        self.with_gc_handle_threshold(Some(AUTO_RECLAIM_THRESHOLD))
+    pub fn new_with_threshold(threshold: Option<usize>) -> (GcHandle, Self) {
+        let shared = Arc::new(SharedState {
+            global_epoch: AtomicUsize::new(0),
+            pending_registrations: SegQueue::new(),
+        });
+
+        let gc = GcHandle {
+            shared: shared.clone(),
+            local_garbage: VecDeque::new(),
+            local_garbage_count: 0,
+            readers: Vec::new(),
+            auto_reclaim_threshold: threshold,
+        };
+
+        let domain = EpochGcDomain {
+            shared,
+        };
+
+        (gc, domain)
     }
 
-    /// Start building a GC handle with a custom auto-reclaim threshold.
-    ///
-    /// # Arguments
-    ///
-    /// * `threshold` - The garbage count threshold that triggers automatic collection.
-    ///   - `Some(n)`: Automatic collection is triggered when garbage count exceeds `n`.
-    ///   - `None`: Automatic collection is disabled; you must call `collect()` manually.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let domain = EpochGcDomain::new();
-    /// let (mut gc, domain) = domain.with_gc_handle_threshold(None)?.into_parts();
-    /// ```
-    ///
-    /// 开始构建具有自定义自动回收阈值的 GC handle。
-    ///
-    /// # 参数
-    ///
-    /// * `threshold` - 触发自动回收的垃圾计数阈值。
-    ///   - `Some(n)`: 当垃圾计数超过 `n` 时触发自动回收。
-    ///   - `None`: 禁用自动回收；必须手动调用 `collect()`。
-    #[inline]
-    pub fn with_gc_handle_threshold(self, threshold: Option<usize>) -> GcHandleBuilder {
-        GcHandleBuilder {
-            shared: self.shared,
-            threshold,
-        }
-    }
-}
-
-impl EpochGcDomain {
     /// Register a new reader for the current thread.
     ///
     /// Returns a `LocalEpoch` that should be stored per-thread.
@@ -473,12 +401,6 @@ impl EpochGcDomain {
             pin_count: Cell::new(0),
             is_registered: Cell::new(false),
         }
-    }
-}
-
-impl Default for EpochGcDomain {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

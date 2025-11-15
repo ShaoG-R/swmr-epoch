@@ -8,8 +8,8 @@ use std::thread;
 /// 测试1: 空的垃圾回收
 #[test]
 fn test_empty_garbage_collection() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, _domain) = EpochGcDomain::new();
     
     // 不退休任何数据，直接回收
     gc.collect();
@@ -21,8 +21,8 @@ fn test_empty_garbage_collection() {
 /// 测试2: 单个数据的退休和回收
 #[test]
 fn test_single_data_retire_and_reclaim() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, _domain) = EpochGcDomain::new();
     
     gc.retire(Box::new(42i32));
     assert_eq!(gc.total_garbage_count(), 1);
@@ -34,8 +34,8 @@ fn test_single_data_retire_and_reclaim() {
 /// 测试3: 恰好达到回收阈值
 #[test]
 fn test_exactly_reach_reclaim_threshold() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, _domain) = EpochGcDomain::new();
     
     // 退休 64 个数据（AUTO_RECLAIM_THRESHOLD = 64）
     for i in 0..64 {
@@ -58,8 +58,8 @@ fn test_exactly_reach_reclaim_threshold() {
 /// 测试4: 超过回收阈值
 #[test]
 fn test_exceed_reclaim_threshold() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, _domain) = EpochGcDomain::new();
     
     // 退休 100 个数据
     for i in 0..100 {
@@ -74,8 +74,8 @@ fn test_exceed_reclaim_threshold() {
 /// 测试5: 零大小类型
 #[test]
 fn test_zero_sized_type() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     #[derive(Debug, PartialEq)]
@@ -93,8 +93,8 @@ fn test_zero_sized_type() {
 /// 测试6: 大型数据结构
 #[test]
 fn test_large_data_structure() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     #[derive(Debug, PartialEq)]
@@ -116,8 +116,8 @@ fn test_large_data_structure() {
 /// 测试7: 嵌套结构体
 #[test]
 fn test_nested_structures() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     #[derive(Debug, PartialEq)]
@@ -149,8 +149,8 @@ fn test_nested_structures() {
 /// 测试8: 向量类型
 #[test]
 fn test_vector_type() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let vec = vec![1, 2, 3, 4, 5];
@@ -168,8 +168,8 @@ fn test_vector_type() {
 /// 测试9: 多次 store 操作
 #[test]
 fn test_multiple_store_operations() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(0i32);
@@ -188,8 +188,8 @@ fn test_multiple_store_operations() {
 /// 测试11: 读取者快速 pin/unpin
 #[test]
 fn test_rapid_pin_unpin() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     for _ in 0..1000 {
@@ -201,8 +201,8 @@ fn test_rapid_pin_unpin() {
 /// 测试12: 多个读取者快速创建和销毁
 #[test]
 fn test_rapid_reader_creation_destruction() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     for _ in 0..100 {
@@ -213,9 +213,8 @@ fn test_rapid_reader_creation_destruction() {
 /// 测试13: 读取者在不同线程中的行为
 #[test]
 fn test_readers_in_different_threads() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
-    let domain = Arc::new(domain);
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     // 创建并启动读取者线程
@@ -248,8 +247,8 @@ fn test_readers_in_different_threads() {
 #[test]
 fn test_writer_cleanup_on_drop() {
     {
-        let domain = EpochGcDomain::new();
-        let (mut gc, _domain) = domain.with_gc_handle().into_parts();
+        
+        let (mut gc, _domain) = EpochGcDomain::new();
         
         for i in 0..50 {
             gc.retire(Box::new(i as i32));
@@ -264,8 +263,8 @@ fn test_writer_cleanup_on_drop() {
 /// 测试15: 读取者 Guard 在 drop 前的清理
 #[test]
 fn test_reader_handle_cleanup_on_drop() {
-    let domain = EpochGcDomain::new();
-    let (_gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (_gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     {
@@ -279,8 +278,8 @@ fn test_reader_handle_cleanup_on_drop() {
 /// 测试16: 交替的纪元推进
 #[test]
 fn test_alternating_epoch_advancement() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     for cycle in 0..10 {
@@ -300,8 +299,8 @@ fn test_alternating_epoch_advancement() {
 /// 测试17: 大量读取者的纪元管理
 #[test]
 fn test_many_readers_epoch_management() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     
     // 创建多个读取者
     let local_epoch1 = domain.register_reader();
@@ -328,8 +327,8 @@ fn test_many_readers_epoch_management() {
 /// 测试18: 读取者在不同纪元的垃圾保护
 #[test]
 fn test_garbage_protection_across_epochs() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     
     // 第一轮：退休数据，读取者活跃
@@ -351,8 +350,8 @@ fn test_garbage_protection_across_epochs() {
 /// 测试19: 动态读取者注册
 #[test]
 fn test_dynamic_reader_registration() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     
     // 创建多个读取者
     let local_epoch1 = domain.register_reader();
@@ -378,8 +377,8 @@ fn test_dynamic_reader_registration() {
 /// 测试20: 压力测试 - 高频操作
 #[test]
 fn test_stress_high_frequency_operations() {
-    let domain = EpochGcDomain::new();
-    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    
+    let (mut gc, domain) = EpochGcDomain::new();
     let local_epoch = domain.register_reader();
     let ptr = Arc::new(EpochPtr::new(0i32));
     

@@ -17,8 +17,7 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let domain = EpochGcDomain::new();
-                    let domain = Arc::new(domain);
+                    let (_gc, domain) = EpochGcDomain::new();
                     let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
@@ -85,8 +84,7 @@ fn bench_scalability(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let domain = EpochGcDomain::new();
-                    let domain = Arc::new(domain);
+                    let (_gc, domain) = EpochGcDomain::new();
                     let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
@@ -149,7 +147,7 @@ fn bench_pin_latency(c: &mut Criterion) {
     group.sample_size(100);
     
     group.bench_function("swmr_epoch_pin_latency", |b| {
-        let domain = EpochGcDomain::new();
+        let (_gc, domain) = EpochGcDomain::new();
         let local_epoch = domain.register_reader();
         
         b.iter(|| {
@@ -177,7 +175,7 @@ fn bench_high_contention(c: &mut Criterion) {
     
     group.bench_function("swmr_epoch_high_contention", |b| {
         b.iter(|| {
-            let domain = EpochGcDomain::new();
+            let (_gc, domain) = EpochGcDomain::new();
             let domain = Arc::new(domain);
             let epoch_ptr = Arc::new(EpochPtr::new(0u64));
             
