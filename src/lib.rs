@@ -45,10 +45,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Weak;
-
-use crossbeam_queue::SegQueue;
+use std::sync::{Arc, Mutex, Weak};
 
 const AUTO_RECLAIM_THRESHOLD: usize = 64;
 const INACTIVE_EPOCH: usize = usize::MAX;
@@ -99,7 +96,7 @@ struct ReaderSlot {
 #[derive(Debug)]
 struct SharedState {
     global_epoch: AtomicUsize,
-    pending_registrations: SegQueue<Arc<ReaderSlot>>,
+    readers: Mutex<Vec<Weak<ReaderSlot>>>,
 }
 
 /// The unique garbage collector handle for an epoch GC domain.
@@ -123,7 +120,6 @@ pub struct GcHandle {
     shared: Arc<SharedState>,
     local_garbage: VecDeque<(usize, Vec<RetiredNode>)>,
     local_garbage_count: usize,
-    readers: Vec<Weak<ReaderSlot>>,
     auto_reclaim_threshold: Option<usize>,
 }
 
@@ -192,27 +188,22 @@ impl GcHandle {
         let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
 
         let mut min_active_epoch = new_epoch;
-        let mut new_readers = Vec::with_capacity(self.readers.len());
 
-        for weak_slot in self.readers.iter() {
+        if let Ok(mut shared_readers) = self.shared.readers.lock() {
+        // 第一遍：遍历，找到最小 epoch
+        for weak_slot in shared_readers.iter() {
             if let Some(slot) = weak_slot.upgrade() {
                 let epoch = slot.active_epoch.load(Ordering::Acquire);
                 if epoch != INACTIVE_EPOCH {
                     min_active_epoch = min_active_epoch.min(epoch);
                 }
-                new_readers.push(weak_slot.clone());
             }
         }
 
-        while let Some(new_slot_arc) = self.shared.pending_registrations.pop() {
-            let epoch = new_slot_arc.active_epoch.load(Ordering::Acquire);
-            if epoch != INACTIVE_EPOCH {
-                min_active_epoch = min_active_epoch.min(epoch);
-            }
-            new_readers.push(Arc::downgrade(&new_slot_arc));
-        }
-
-        self.readers = new_readers;
+        // 第二遍：使用 retain 原地移除已死的 readers
+        // 这样可以避免分配一个全新的 Vec
+        shared_readers.retain(|weak_slot| weak_slot.upgrade().is_some());
+    }
 
         let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
             usize::MAX
@@ -261,7 +252,6 @@ pub struct LocalEpoch {
     slot: Arc<ReaderSlot>,
     shared: Arc<SharedState>,
     pin_count: Cell<usize>,
-    is_registered: Cell<bool>,
 }
 
 impl LocalEpoch {
@@ -289,11 +279,6 @@ impl LocalEpoch {
             self.slot
                 .active_epoch
                 .store(current_epoch, Ordering::Release);
-
-            if !self.is_registered.get() {
-                self.shared.pending_registrations.push(self.slot.clone());
-                self.is_registered.set(true);
-            }
         }
 
         self.pin_count.set(pin_count + 1);
@@ -362,14 +347,13 @@ impl EpochGcDomain {
     pub fn new_with_threshold(threshold: Option<usize>) -> (GcHandle, Self) {
         let shared = Arc::new(SharedState {
             global_epoch: AtomicUsize::new(0),
-            pending_registrations: SegQueue::new(),
+            readers: Mutex::new(Vec::new()),
         });
 
         let gc = GcHandle {
             shared: shared.clone(),
             local_garbage: VecDeque::new(),
             local_garbage_count: 0,
-            readers: Vec::new(),
             auto_reclaim_threshold: threshold,
         };
 
@@ -395,11 +379,16 @@ impl EpochGcDomain {
             active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
         });
 
+        // Register the reader immediately in the shared readers list
+        let weak_slot = Arc::downgrade(&slot);
+        if let Ok(mut readers) = self.shared.readers.lock() {
+            readers.push(weak_slot);
+        }
+
         LocalEpoch {
             slot,
             shared: self.shared.clone(),
             pin_count: Cell::new(0),
-            is_registered: Cell::new(false),
         }
     }
 }
