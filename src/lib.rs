@@ -144,11 +144,6 @@ impl GcHandleBuilder {
     }
 }
 
-/// Marker type indicating that a GC handle has been created.
-/// Used internally to track state at compile-time.
-/// 标记类型，表示 GC handle 已创建。用于在编译时跟踪状态。
-pub struct GcHandleCreated;
-
 /// The unique garbage collector handle for an epoch GC domain.
 ///
 /// There should be exactly one `GcHandle` per `EpochGcDomain`, owned by the writer thread.
