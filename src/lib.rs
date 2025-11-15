@@ -1,27 +1,61 @@
-use std::cell::{Cell, UnsafeCell};
-use std::collections::BTreeMap;
-// Used for the thread-local pin count
-// 用于线程本地的 pin 计数
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+//! # Epoch-Based Garbage Collection
+//!
+//! This module provides a lock-free, single-writer, multi-reader garbage collection system
+//! based on epoch-based reclamation. It is designed for scenarios where:
+//!
+//! - One thread (the writer) owns and updates shared data structures.
+//! - Multiple reader threads concurrently access the same data.
+//! - Readers need to safely access data without blocking the writer.
+//!
+//! ## Core Concepts
+//!
+//! **Epoch**: A logical timestamp that advances monotonically. The writer increments the epoch
+//! during garbage collection cycles. Readers "pin" themselves to an epoch, declaring that they
+//! are actively reading data from that epoch.
+//!
+//! **Pin**: When a reader calls `pin()`, it records the current epoch in its slot. This tells
+//! the writer: "I am reading data from this epoch; do not reclaim it yet."
+//!
+//! **Reclamation**: The writer collects retired objects and reclaims those from epochs that
+//! are older than the minimum epoch of all active readers.
+//!
+//! ## Typical Usage
+//!
+//! ```ignore
+//! // 1. Create a shared GC domain (can be cloned across threads)
+//! let domain = EpochGcDomain::new();
+//!
+//! // 2. Create the unique garbage collector in the writer thread
+//! let mut gc = domain.gc_handle();
+//!
+//! // 3. In each reader thread, register a local epoch
+//! let local_epoch = domain.register_reader();
+//!
+//! // 4. Readers pin themselves before accessing shared data
+//! let guard = local_epoch.pin();
+//! let value = shared_ptr.load(&guard);
+//! // ... use value ...
+//! // guard is automatically dropped, unpinning the thread
+//!
+//! // 5. Writer updates shared data and drives garbage collection
+//! shared_ptr.store(new_value, &mut gc);
+//! gc.collect();  // Reclaim garbage from old epochs
+//! ```
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Weak;
 
 use crossbeam_queue::SegQueue;
 
-// Garbage collection trigger threshold
-// 垃圾回收的触发阈值
-const RECLAIM_THRESHOLD: usize = 64;
-
-// Represents an "inactive" epoch
-// 代表"不活跃"的纪元
+const AUTO_RECLAIM_THRESHOLD: usize = 64;
 const INACTIVE_EPOCH: usize = usize::MAX;
 
-// Type-erased wrapper for a "retired" object
-// 一个被"退休"的对象的类型擦除包装
-type ErasedGarbage = Garbage;
+type RetiredNode = RetiredObject;
 
-struct Garbage {
+struct RetiredObject {
     ptr: *mut (),
     dtor: unsafe fn(*mut ()),
 }
@@ -34,18 +68,18 @@ unsafe fn drop_value<T>(ptr: *mut ()) {
     }
 }
 
-impl Garbage {
+impl RetiredObject {
     #[inline(always)]
     fn new<T: 'static>(value: Box<T>) -> Self {
         let ptr = Box::into_raw(value) as *mut ();
-        Garbage {
+        RetiredObject {
             ptr,
             dtor: drop_value::<T>,
         }
     }
 }
 
-impl Drop for Garbage {
+impl Drop for RetiredObject {
     #[inline(always)]
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -57,374 +91,420 @@ impl Drop for Garbage {
     }
 }
 
-// Thread-local storage for participant state
-// 线程本地的参与者状态存储
-// Using UnsafeCell for zero-overhead access (safe because TLS is single-threaded)
-// 使用 UnsafeCell 以实现零开销访问（安全，因为 TLS 是单线程的）
-thread_local! {
-    static THREAD_LOCAL_PARTICIPANT: UnsafeCell<Option<ThreadLocalParticipant>> = UnsafeCell::new(None);
-}
-
-// --- 1. Internal shared state ---
-// --- 1. 内部共享状态 ---
-
-/// Slot for each reader thread in the global table
-/// 每个读取者线程在全局表格中对应的"槽位"
 #[derive(Debug)]
-struct ParticipantSlot {
-    // `usize::MAX` (INACTIVE_EPOCH) indicates inactive
-    // `usize::MAX` (INACTIVE_EPOCH) 表示不活跃
+struct ReaderSlot {
     active_epoch: AtomicUsize,
 }
 
-/// Global state shared by all threads
-/// 所有线程共享的全局状态
 #[derive(Debug)]
 struct SharedState {
-    /// Global epoch, only Writer can advance it
-    /// 全局纪元，只有 Writer 可以推进
     global_epoch: AtomicUsize,
-
-    /// Lock-free queue for receiving registration requests from new readers
-    /// 用于接收新读取者注册请求的无锁队列
-    pending_registrations: SegQueue<Arc<ParticipantSlot>>,
+    pending_registrations: SegQueue<Arc<ReaderSlot>>,
 }
 
-// --- 2. Writer ---
-// --- 2. 写入者 ---
-
-/// The unique writer handle
-/// 唯一的写入者句柄
-pub struct Writer {
+/// The unique garbage collector handle for an epoch GC domain.
+///
+/// There should be exactly one `GcHandle` per `EpochGcDomain`, owned by the writer thread.
+/// It is responsible for:
+/// - Advancing the global epoch during collection cycles.
+/// - Receiving retired objects from `EpochPtr::store()`.
+/// - Scanning active readers and reclaiming garbage from old epochs.
+///
+/// **Thread Safety**: `GcHandle` is not thread-safe and must be owned by a single thread.
+///
+/// 一个 epoch GC 域的唯一垃圾回收器句柄。
+/// 每个 `EpochGcDomain` 应该恰好有一个 `GcHandle`，由写入者线程持有。
+/// 它负责：
+/// - 在回收周期中推进全局纪元。
+/// - 从 `EpochPtr::store()` 接收已退休对象。
+/// - 扫描活跃读者并回收旧纪元的垃圾。
+/// **线程安全性**：`GcHandle` 不是线程安全的，必须由单个线程持有。
+pub struct GcHandle {
     shared: Arc<SharedState>,
-    
-    /// Writer's private garbage bin, grouped by epoch
-    /// 写入者私有的垃圾桶，按 epoch 分组
-    /// Key: epoch, Value: list of garbage for that epoch
-    /// 键：纪元，值：该纪元的垃圾列表
-    local_garbage: BTreeMap<usize, Vec<ErasedGarbage>>,
-
-    /// Total count of all items in local_garbage across all epochs
-    /// local_garbage 中所有 epoch 的项的总数
+    local_garbage: BTreeMap<usize, Vec<RetiredNode>>,
     local_garbage_count: usize,
-
-    /// Participant list
-    /// 参与者列表
-    participants: Vec<Weak<ParticipantSlot>>,
+    readers: Vec<Weak<ReaderSlot>>,
 }
 
-impl Writer {
-    /// Get total garbage count across all epochs
-    /// 获取所有 epoch 中的垃圾总数
+impl GcHandle {
     #[inline]
     fn total_garbage_count(&self) -> usize {
         self.local_garbage_count
     }
 
-    /// Retire (defer deletion) a pointer
-    /// 退休（延迟删除）一个指针
+    /// Retire (defer deletion) of a value.
+    ///
+    /// The value is stored in a garbage bin associated with the current epoch.
+    /// It will be reclaimed once the epoch becomes older than all active readers' epochs.
+    ///
+    /// This is an internal method used by `EpochPtr::store()`.
+    /// If garbage count exceeds `AUTO_RECLAIM_THRESHOLD`, automatic collection is triggered.
+    ///
+    /// 退休（延迟删除）一个值。
+    /// 该值被存储在与当前纪元关联的垃圾桶中。
+    /// 一旦该纪元比所有活跃读者的纪元都更旧，它就会被回收。
+    /// 这是 `EpochPtr::store()` 使用的内部方法。
+    /// 如果垃圾计数超过 `AUTO_RECLAIM_THRESHOLD`，自动回收被触发。
     pub fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
-        
-        // Get the garbage bag for the current epoch, or create a new one
-        // O(log E) to find/create the entry, then O(1) amortized push
-        // 获取当前纪元的垃圾袋，如果不存在则创建一个
-        // O(log E) 查找/创建条目，然后 O(1) 摊销的 push
+
         self.local_garbage
             .entry(current_epoch)
             .or_default()
-            .push(Garbage::new(data));
+            .push(RetiredObject::new(data));
 
-            // Increment the total count
-            // 增加总计数
-            self.local_garbage_count += 1;
-            // --- 添加结束 ---
+        self.local_garbage_count += 1;
 
-            // Check if total garbage exceeds threshold
-            // 检查垃圾总数是否超过阈值
-            if self.total_garbage_count() > RECLAIM_THRESHOLD {
-                self.try_reclaim();
+        if self.total_garbage_count() > AUTO_RECLAIM_THRESHOLD {
+            self.collect();
         }
     }
 
-    /// Try to reclaim garbage
-    /// 尝试回收垃圾
-    pub fn try_reclaim(&mut self) {
-        // Step 1: Advance global epoch
-        // 步骤 1: 推进全局纪元
+    /// Perform a garbage collection cycle.
+    ///
+    /// This method:
+    /// 1. Advances the global epoch.
+    /// 2. Scans all active readers to find the minimum active epoch.
+    /// 3. Reclaims garbage from epochs older than the minimum active epoch.
+    ///
+    /// Can be called periodically or after significant updates.
+    /// Safe to call even if there is no garbage to reclaim.
+    ///
+    /// 执行一个垃圾回收周期。
+    /// 此方法：
+    /// 1. 推进全局纪元。
+    /// 2. 扫描所有活跃读者以找到最小活跃纪元。
+    /// 3. 回收比最小活跃纪元更旧的纪元中的垃圾。
+    /// 可以定期调用或在重大更新后调用。
+    /// 即使没有垃圾要回收也可以安全调用。
+    pub fn collect(&mut self) {
         let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
 
         let mut min_active_epoch = new_epoch;
-        let mut new_participants = Vec::with_capacity(self.participants.len());
+        let mut new_readers = Vec::with_capacity(self.readers.len());
 
-        // Step 2.A: Scan old participants (O(N))
-        // 步骤 2.A: 扫描旧的参与者 (O(N))
-        for weak_slot in self.participants.iter() {
+        for weak_slot in self.readers.iter() {
             if let Some(slot) = weak_slot.upgrade() {
-                // Reader is still active
-                // 读取者仍然活跃
                 let epoch = slot.active_epoch.load(Ordering::Acquire);
-                min_active_epoch = min_active_epoch.min(epoch);
-                new_participants.push(weak_slot.clone());
+                if epoch != INACTIVE_EPOCH {
+                    min_active_epoch = min_active_epoch.min(epoch);
+                }
+                new_readers.push(weak_slot.clone());
             }
-            // else: offline reader, auto-remove
-            // else: 掉线的读取者，自动移除
         }
 
-        // Step 2.B: Register all new readers (O(P))
-        // 步骤 2.B: 注册所有新来的读取者 (O(P))
         while let Some(new_slot_arc) = self.shared.pending_registrations.pop() {
             let epoch = new_slot_arc.active_epoch.load(Ordering::Acquire);
-            min_active_epoch = min_active_epoch.min(epoch);
-            new_participants.push(Arc::downgrade(&new_slot_arc));
+            if epoch != INACTIVE_EPOCH {
+                min_active_epoch = min_active_epoch.min(epoch);
+            }
+            new_readers.push(Arc::downgrade(&new_slot_arc));
         }
 
-        // Step 2.C: Replace old list
-        // 步骤 2.C: 替换旧列表
-        self.participants = new_participants;
+        self.readers = new_readers;
 
-        // Step 3: Calculate safe reclamation point
-        // 步骤 3: 计算安全回收点
-        let safe_to_reclaim_epoch = min_active_epoch.saturating_sub(1);
+        let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
+            usize::MAX
+        } else {
+            min_active_epoch.saturating_sub(1)
+        };
 
-        // Step 4: Release garbage (Optimized using BTreeMap::retain O(E))
-        // 步骤 4: 释放垃圾 (使用 BTreeMap::retain O(E) 优化)
-        
-        // We use `retain` (O(E) traversal) instead of `split_off` (O(log E) split).
-        // While `split_off` is algorithmically faster, `retain` modifies in-place
-        // and, critically, *avoids new allocations*.
-        // This prevents contention on the global allocator, which could otherwise
-        // slow down the *first* `pin()` operation on reader threads.
-        //
-        // 我们使用 `retain` (O(E) 遍历) 而不是 `split_off` (O(log E) 分裂)。
-        // 虽然 `split_off` 算法上更快，但 `retain` 是就地修改，
-        // 并且（关键地）*避免了新的内存分配*。
-        // 这防止了对全局分配器的争用，否则这种争用可能会拖慢
-        // 读取者线程的*首次* `pin()` 操作。
-
-        // We need a counter to track the total garbage we are *keeping*.
-        // 我们需要一个计数器来跟踪我们 *保留* 下来的垃圾总数。
         let mut retained_count = 0;
 
-        // `BTreeMap::retain` iterates over all E entries.
-        // The closure returns `true` to keep an entry, or `false` to remove (and drop) it.
-        // `BTreeMap::retain` 会遍历所有 E 个条目。
-        // 闭包返回 true 则保留，返回 false 则删除（并 drop）。
         self.local_garbage.retain(|&epoch, bag| {
             if epoch > safe_to_reclaim_epoch {
-                // This epoch is > the safe point, so we *keep* (retain) it.
-                // Add its count to the items we are keeping.
-                // 这个纪元 > 安全点，我们需要 *保留* (retain) 它。
-                // 将其数量累加到保留计数中。
-                retained_count += bag.len(); 
-                
-                true // Return true to keep this entry
+                retained_count += bag.len();
+                true
             } else {
-                // This epoch is <= the safe point, so we *remove* (drop) it.
-                // 这个纪元 <= 安全点，我们可以 *删除* (drop) 它。
-                
-                false // Return false to remove and drop this entry (and its bag)
+                false
             }
         });
 
-        // Update the total garbage count to only include what we retained.
-        // 更新总垃圾计数，使其只包含我们保留下来的部分。
         self.local_garbage_count = retained_count;
     }
 }
 
-// --- 3. Reader ---
-// --- 3. 读取者 ---
-
-/// Holds the thread-local state for a reader
-/// 持有读取者的线程本地状态
+/// A reader thread's local epoch state.
 ///
-/// Contains the participant slot and the reentrant pin count.
-/// 包含参与者槽位和可重入的 pin 计数。
-struct ThreadLocalParticipant {
-    /// This thread's participant slot
-    /// 此线程的参与者槽位
-    slot: Arc<ParticipantSlot>,
-    /// Reentrant pin count for this thread
-    /// 此线程的可重入 pin 计数
+/// Each reader thread should create exactly one `LocalEpoch` via `EpochGcDomain::register_reader()`.
+/// It is `!Sync` (due to `Cell`) and must be stored per-thread.
+///
+/// The `LocalEpoch` is used to:
+/// - Pin the thread to the current epoch via `pin()`.
+/// - Obtain a `PinGuard` that protects access to `EpochPtr` values.
+///
+/// **Thread Safety**: `LocalEpoch` is not `Sync` and must be used by only one thread.
+///
+/// 读者线程的本地纪元状态。
+/// 每个读者线程应该通过 `EpochGcDomain::register_reader()` 创建恰好一个 `LocalEpoch`。
+/// 它是 `!Sync` 的（因为 `Cell`），必须在每个线程中存储。
+/// `LocalEpoch` 用于：
+/// - 通过 `pin()` 将线程钉住到当前纪元。
+/// - 获取保护对 `EpochPtr` 值的访问的 `PinGuard`。
+/// **线程安全性**：`LocalEpoch` 不是 `Sync` 的，必须仅由一个线程使用。
+pub struct LocalEpoch {
+    slot: Arc<ReaderSlot>,
+    shared: Arc<SharedState>,
     pin_count: Cell<usize>,
 }
 
-/// Cloneable reader registry
-/// 可克隆的读取者注册表
+impl LocalEpoch {
+    /// Pin this thread to the current epoch.
+    ///
+    /// Returns a `PinGuard` that keeps the thread pinned for its lifetime.
+    /// This method is reentrant: multiple calls can be nested, and the thread
+    /// remains pinned until all returned guards are dropped.
+    ///
+    /// While pinned, the thread is considered "active" at a particular epoch,
+    /// and the garbage collector will not reclaim data from that epoch.
+    ///
+    /// 将此线程钉住到当前纪元。
+    /// 返回一个 `PinGuard`，在其生命周期内保持线程被钉住。
+    /// 此方法是可重入的：多个调用可以嵌套，线程
+    /// 在所有返回的守卫被 drop 之前保持被钉住。
+    /// 当被钉住时，线程被认为在特定纪元"活跃"，
+    /// 垃圾回收器不会回收该纪元的数据。
+    #[inline]
+    pub fn pin(&self) -> PinGuard<'_> {
+        let pin_count = self.pin_count.get();
+
+        if pin_count == 0 {
+            let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
+            self.slot
+                .active_epoch
+                .store(current_epoch, Ordering::Release);
+        }
+
+        self.pin_count.set(pin_count + 1);
+
+        PinGuard {
+            reader: self,
+        }
+    }
+}
+
+/// An epoch-based garbage collection domain.
 ///
-/// This replaces ReaderFactory. It is Clone, Send, Sync.
-/// 它取代了 ReaderFactory。它是 Clone, Send, Sync。
-/// It can be shared across all threads.
-/// 可以在所有线程间共享。
-/// Uses thread_local! macro for zero-overhead TLS access.
-/// 使用 thread_local! 宏实现零开销的 TLS 访问。
+/// `EpochGcDomain` is the entry point for creating an epoch-based GC system.
+/// It manages:
+/// - The global epoch counter.
+/// - Registration of reader threads.
+/// - Creation of the unique garbage collector.
+///
+/// `EpochGcDomain` is `Clone` and can be safely shared across threads.
+/// Typically, you create one domain at startup and clone it to threads that need it.
+///
+/// **Typical Usage**:
+/// ```ignore
+/// // Main thread: create the domain
+/// let domain = EpochGcDomain::new();
+///
+/// // Writer thread: create the garbage collector
+/// let mut gc = domain.gc_handle();
+///
+/// // Reader threads: register and pin
+/// let local_epoch = domain.register_reader();
+/// let guard = local_epoch.pin();
+/// ```
+///
+/// 基于纪元的垃圾回收域。
+/// `EpochGcDomain` 是创建基于纪元的 GC 系统的入口点。
+/// 它管理：
+/// - 全局纪元计数器。
+/// - 读者线程的注册。
+/// - 唯一垃圾回收器的创建。
+/// `EpochGcDomain` 是 `Clone` 的，可以安全地在线程间共享。
+/// 通常，你在启动时创建一个域并将其克隆到需要它的线程。
 #[derive(Clone)]
-pub struct ReaderRegistry {
+pub struct EpochGcDomain {
     shared: Arc<SharedState>,
 }
 
-impl ReaderRegistry {
-    /// Pins the current thread.
-    /// "钉住"当前线程。
+impl EpochGcDomain {
+    /// Create a new epoch GC domain.
+    /// 创建一个新的 epoch GC 域。
+    pub fn new() -> Self {
+        EpochGcDomain {
+            shared: Arc::new(SharedState {
+                global_epoch: AtomicUsize::new(0),
+                pending_registrations: SegQueue::new(),
+            }),
+        }
+    }
+
+    /// Create the unique garbage collector handle for this domain.
     ///
-    /// This method is reentrant. It returns a Guard that, when dropped,
-    /// will unpin the thread if it's the last remaining guard.
-    /// 此方法是可重入的。它返回一个 Guard，当 Guard 被 drop 时，
-    /// 如果这是最后一个 Guard，它将"解钉"线程。
-    pub fn pin(&self) -> Guard {
-        THREAD_LOCAL_PARTICIPANT.with(|tls_cell| {
-            // SAFETY: We are in a single-threaded context (thread-local storage).
-            // No other thread can access this data.
-            // SAFETY: 我们在单线程上下文中（线程本地存储）。
-            // 没有其他线程可以访问此数据。
-            let participant_opt = unsafe { &mut *tls_cell.get() };
-            
-            // Initialize on first access
-            // 第一次访问时初始化
-            if participant_opt.is_none() {
-                let slot = Arc::new(ParticipantSlot {
-                    active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
-                });
-                self.shared.pending_registrations.push(slot.clone());
-                *participant_opt = Some(ThreadLocalParticipant {
-                    slot,
-                    pin_count: Cell::new(0),
-                });
-            }
-            
-            let participant = participant_opt.as_ref().unwrap();
-            let pin_count = participant.pin_count.get();
-            
-            if pin_count == 0 {
-                // This is the first pin on this thread. Mark as active.
-                // 这是此线程上的第一个 pin。标记为活跃。
-                let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
-                participant
-                    .slot
-                    .active_epoch
-                    .store(current_epoch, Ordering::Release);
-            }
-            
-            // Increment the reentrant pin count
-            // 增加可重入 pin 计数
-            participant.pin_count.set(pin_count + 1);
-            
-            // Return a new guard pointing to the thread-local data
-            // 返回一个指向线程本地数据的 Guard
-            Guard {
-                local: participant as *const ThreadLocalParticipant,
-            }
-        })
+    /// There should be exactly one `GcHandle` per domain, owned by the writer thread.
+    /// Calling this multiple times will create multiple independent handles,
+    /// which is not recommended and may lead to incorrect behavior.
+    ///
+    /// 为此域创建唯一的垃圾回收器句柄。
+    /// 每个域应该恰好有一个 `GcHandle`，由写入者线程持有。
+    /// 多次调用此方法会创建多个独立的句柄，
+    /// 不推荐这样做，可能导致不正确的行为。
+    pub fn gc_handle(&self) -> GcHandle {
+        GcHandle {
+            shared: self.shared.clone(),
+            local_garbage: BTreeMap::new(),
+            local_garbage_count: 0,
+            readers: Vec::new(),
+        }
+    }
+
+    /// Register a new reader for the current thread.
+    ///
+    /// Returns a `LocalEpoch` that should be stored per-thread.
+    /// The caller is responsible for ensuring that each `LocalEpoch` is used
+    /// by only one thread.
+    ///
+    /// 为当前线程注册一个新的读者。
+    /// 返回一个应该在每个线程中存储的 `LocalEpoch`。
+    /// 调用者有责任确保每个 `LocalEpoch` 仅由一个线程使用。
+    pub fn register_reader(&self) -> LocalEpoch {
+        let slot = Arc::new(ReaderSlot {
+            active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
+        });
+
+        self.shared.pending_registrations.push(slot.clone());
+
+        LocalEpoch {
+            slot,
+            shared: self.shared.clone(),
+            pin_count: Cell::new(0),
+        }
     }
 }
 
-/// A guard that keeps the current thread pinned.
-/// 一个保持当前线程被"钉住"的守卫。
+impl Default for EpochGcDomain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A guard that keeps the current thread pinned to an epoch.
 ///
-/// This guard is !Send and !Sync because it references thread-local data.
-/// 此守卫是 !Send 和 !Sync 的，因为它引用了线程本地数据。
-/// It holds a raw pointer *const to the thread's ThreadLocalParticipant.
-/// 它持有一个指向线程的 ThreadLocalParticipant 的裸指针 *const。
+/// `PinGuard` is obtained by calling `LocalEpoch::pin()`.
+/// It is `!Send` and `!Sync` because it references a `!Sync` `LocalEpoch`.
+/// Its lifetime is bound to the `LocalEpoch` it came from.
 ///
-/// Dropping the guard decrements the thread-local pin count and unpins
-/// the thread if the count reaches zero.
-/// Drop 此守卫会减少线程本地的 pin 计数，并在计数达到零时"解钉"线程。
+/// While a `PinGuard` is held, the thread is considered "active" at a particular epoch,
+/// and the garbage collector will not reclaim data from that epoch.
+///
+/// `PinGuard` can be cloned (which increments the pin count), allowing nested pinning.
+/// The thread remains pinned until all cloned guards are dropped.
+///
+/// **Safety**: The `PinGuard` is the mechanism that ensures safe concurrent access to
+/// `EpochPtr` values. Readers must always hold a valid `PinGuard` when accessing
+/// shared data through `EpochPtr::load()`.
+///
+/// 一个保持当前线程被钉住到一个纪元的守卫。
+/// `PinGuard` 通过调用 `LocalEpoch::pin()` 获得。
+/// 它是 `!Send` 和 `!Sync` 的，因为它引用了一个 `!Sync` 的 `LocalEpoch`。
+/// 它的生命周期被绑定到它来自的 `LocalEpoch`。
+/// 当 `PinGuard` 被持有时，线程被认为在特定纪元"活跃"，
+/// 垃圾回收器不会回收该纪元的数据。
+/// `PinGuard` 可以被克隆（增加 pin 计数），允许嵌套 pinning。
+/// 线程保持被钉住直到所有克隆的守卫被 drop。
+/// **安全性**：`PinGuard` 是确保对 `EpochPtr` 值安全并发访问的机制。
+/// 读者在通过 `EpochPtr::load()` 访问共享数据时必须始终持有有效的 `PinGuard`。
 #[must_use]
-pub struct Guard {
-    local: *const ThreadLocalParticipant,
+pub struct PinGuard<'a> {
+    reader: &'a LocalEpoch,
 }
 
-impl Clone for Guard {
-    /// Cloning a guard is a valid way to re-pin.
-    /// 克隆一个守卫是合法的重"钉" (re-pin) 方式。
-    /// This increments the thread-local pin count.
-    /// 这会增加线程本地的 pin 计数。
+impl<'a> Clone for PinGuard<'a> {
+    /// Clone this guard to create a nested pin.
+    ///
+    /// Cloning increments the pin count, and the thread remains pinned
+    /// until all cloned guards are dropped.
+    ///
+    /// 克隆此守卫以创建嵌套 pin。
+    /// 克隆会增加 pin 计数，线程保持被钉住
+    /// 直到所有克隆的守卫被 drop。
     fn clone(&self) -> Self {
-        // SAFETY: local points to this thread's valid TLS data.
-        // SAFETY: local 指向此线程的有效 TLS 数据。
-        let participant = unsafe { &*self.local };
-        let pin_count = participant.pin_count.get();
+        let pin_count = self.reader.pin_count.get();
 
-        // We must be in a pinned state to clone
-        // 克隆时必须处于"钉住"状态
-        assert!(pin_count > 0, "Cloning a guard in an unpinned state");
+        assert!(
+            pin_count > 0,
+            "BUG: Cloning a PinGuard in an unpinned state (pin_count = 0). \
+             This indicates incorrect API usage or a library bug."
+        );
 
-        // Increment pin count
-        // 增加 pin 计数
-        participant.pin_count.set(pin_count + 1);
+        self.reader.pin_count.set(pin_count + 1);
 
-        // Return a new guard pointing to the same data
-        // 返回一个指向相同数据的新守卫
-        Guard { local: self.local }
+        PinGuard {
+            reader: self.reader,
+        }
     }
 }
 
-impl Drop for Guard {
+impl<'a> Drop for PinGuard<'a> {
     fn drop(&mut self) {
-        // SAFETY: local points to this thread's valid TLS data.
-        // SAFETY: local 指向此线程的有效 TLS 数据。
-        let participant = unsafe { &*self.local };
-        let pin_count = participant.pin_count.get();
+        let pin_count = self.reader.pin_count.get();
 
-        // We must be in a pinned state to drop
-        // Drop 时必须处于"钉住"状态
-        assert!(pin_count > 0, "Dropping a guard in an unpinned state");
+        assert!(
+            pin_count > 0,
+            "BUG: Dropping a PinGuard in an unpinned state (pin_count = 0). \
+             This indicates incorrect API usage or a library bug."
+        );
 
         if pin_count == 1 {
-            // This is the last guard. Mark the thread as inactive.
-            // 这是最后一个守卫。标记线程为不活跃。
-            // Use Release to ensure this is visible to the Writer.
-            // 使用 Release 确保这对写入者可见。
-            participant
+            self.reader
                 .slot
                 .active_epoch
                 .store(INACTIVE_EPOCH, Ordering::Release);
         }
 
-        // Decrement the reentrant pin count
-        // 减少可重入 pin 计数
-        participant.pin_count.set(pin_count - 1);
+        self.reader.pin_count.set(pin_count - 1);
     }
 }
 
-// --- 4. Entry point ---
-// --- 4. 入口点 ---
-
-/// Create a new SWMR epoch system
-/// 创建一个新的 SWMR 纪元系统
+/// An epoch-protected shared pointer for safe concurrent access.
 ///
-/// Returns the Writer and the ReaderRegistry.
-/// 返回 Writer 和 ReaderRegistry。
-pub fn new() -> (Writer, ReaderRegistry) {
-    let shared = Arc::new(SharedState {
-        global_epoch: AtomicUsize::new(0),
-        pending_registrations: SegQueue::new(),
-    });
-
-    let writer = Writer {
-        shared: shared.clone(),
-        local_garbage_count: 0,
-        participants: Vec::new(),
-        local_garbage: BTreeMap::new(),
-    };
-
-    let registry = ReaderRegistry {
-        shared,
-    };
-
-    (writer, registry)
-}
-
-/// An epoch-protected atomic pointer
-/// 一个受 epoch 保护的原子指针
-pub struct Atomic<T> {
+/// `EpochPtr<T>` is an atomic pointer that can be safely read by multiple readers
+/// (via `load()` with a `PinGuard`) and safely written by a single writer
+/// (via `store()` with a `GcHandle`).
+///
+/// **Safety Contract**:
+/// - Readers must hold a `PinGuard` when calling `load()`. The `PinGuard` ensures
+///   that the reader is pinned to an epoch, and the writer will not reclaim the
+///   data until the guard is dropped.
+/// - Writers must use the same `GcHandle` for all `store()` calls on pointers
+///   that may be accessed by the same readers. This ensures proper garbage collection.
+/// - The lifetime of the returned reference from `load()` is bound to the `PinGuard`.
+///
+/// **Typical Usage**:
+/// ```ignore
+/// let shared = EpochPtr::new(initial_value);
+///
+/// // Reader thread:
+/// let guard = local_epoch.pin();
+/// let value = shared.load(&guard);
+/// // use value...
+/// drop(guard);
+///
+/// // Writer thread:
+/// shared.store(new_value, &mut gc);
+/// gc.collect();
+/// ```
+///
+/// 一个受 epoch 保护的共享指针，用于安全的并发访问。
+/// `EpochPtr<T>` 是一个原子指针，可以被多个读者安全读取
+/// （通过 `load()` 和 `PinGuard`），也可以被单个写入者安全写入
+/// （通过 `store()` 和 `GcHandle`）。
+/// **安全合约**：
+/// - 读者在调用 `load()` 时必须持有 `PinGuard`。`PinGuard` 确保
+///   读者被钉住到一个纪元，写入者不会在守卫被 drop 之前回收数据。
+/// - 写入者必须对所有可能被相同读者访问的指针使用相同的 `GcHandle`。
+///   这确保了正确的垃圾回收。
+/// - 从 `load()` 返回的引用的生命周期被绑定到 `PinGuard`。
+pub struct EpochPtr<T> {
     ptr: AtomicPtr<T>,
 }
 
-impl<T: 'static> Atomic<T> {
-    /// Create a new atomic pointer, initialized with the given data
-    /// 创建一个新的原子指针，初始化为给定的数据
+impl<T: 'static> EpochPtr<T> {
+    /// Create a new epoch-protected pointer, initialized with the given value.
+    /// 创建一个新的受 epoch 保护的指针，初始化为给定的值。
     #[inline]
     pub fn new(data: T) -> Self {
         Self {
@@ -432,52 +512,62 @@ impl<T: 'static> Atomic<T> {
         }
     }
 
-    /// Reader load
-    /// 读取者 load
+    /// Reader load: safely read the current value.
     ///
-    /// Must provide a &Guard.
-    /// 必须提供一个 &Guard。
-    /// The lifetime of the returned reference &T is bound to the lifetime
-    /// of the Guard.
-    /// 返回的引用 &T 的生命周期被绑定到 Guard 的生命周期。
+    /// The `guard` parameter ensures that the calling thread is pinned to an epoch,
+    /// preventing the writer from reclaiming the data during the read.
+    /// The lifetime of the returned reference is bound to the guard's lifetime.
+    ///
+    /// # Panics
+    /// This method does not panic, but the `guard` parameter is required for safety.
+    /// If you call this without a valid `PinGuard`, you are violating the API contract.
+    ///
+    /// 读取者 load：安全地读取当前值。
+    /// `guard` 参数确保调用线程被钉住到一个纪元，
+    /// 防止写入者在读取期间回收数据。
+    /// 返回的引用的生命周期被绑定到守卫的生命周期。
     #[inline]
-    pub fn load<'guard>(&self, _guard: &'guard Guard) -> &'guard T {
+    pub fn load<'guard>(&self, _guard: &'guard PinGuard) -> &'guard T {
         let ptr = self.ptr.load(Ordering::Acquire);
-        // SAFETY:
-        // 1. ptr is always valid.
-        // 1. ptr 总是有效的。
-        // 2. The _guard guarantees the thread is pinned, so the
-        //    writer will not reclaim the data ptr points to.
-        // 2. _guard 保证了线程被"钉住"，所以写入者
-        //    不会回收 ptr 指向的数据。
-        // 3. The lifetime 'guard ensures the reference cannot outlive the pin.
-        // 3. 'guard 生命周期确保了引用不会比"钉"存活更久。
         unsafe { &*ptr }
     }
 
-    /// Writer store
-    /// 写入者 store
-        pub fn store(&self, data: Box<T>, writer: &mut Writer) {
-        let new_ptr = Box::into_raw(data);
+    /// Writer store: safely update the value and retire the old one.
+    ///
+    /// This method atomically replaces the current pointer with a new one,
+    /// and enqueues the old value for garbage collection.
+    /// The old value will be reclaimed once it is safe to do so (i.e., after
+    /// all readers have moved past the epoch in which it was retired).
+    ///
+    /// 写入者 store：安全地更新值并退休旧值。
+    /// 此方法原子地用新指针替换当前指针，
+    /// 并将旧值入队进行垃圾回收。
+    /// 旧值将在安全时被回收（即，在所有读者都已超过
+    /// 退休该值的纪元之后）。
+    #[inline]
+    pub fn store(&self, data: T, gc: &mut GcHandle) {
+        let new_ptr = Box::into_raw(Box::new(data));
         let old_ptr = self.ptr.swap(new_ptr, Ordering::Release);
 
-        // Give the old pointer to GC
-        // 将旧指针交给 GC
         if !old_ptr.is_null() {
             unsafe {
-                writer.retire(Box::from_raw(old_ptr));
+                gc.retire(Box::from_raw(old_ptr));
             }
         }
     }
 }
 
-impl<T> Drop for Atomic<T> {
+impl<T> Drop for EpochPtr<T> {
+    /// When an `EpochPtr` is dropped, it safely drops the current value.
+    ///
+    /// At drop time, we assume no other threads are accessing the pointer,
+    /// so we can safely take back and drop the final value.
+    ///
+    /// 当 `EpochPtr` 被 drop 时，它安全地 drop 当前值。
+    /// 在 drop 时，我们假设没有其他线程在访问该指针，
+    /// 所以我们可以安全地拿回并 drop 最后的值。
     #[inline]
     fn drop(&mut self) {
-        // At `drop` time, we assume no other threads are accessing
-        // 在 `drop` 时，我们假设没有其他线程在访问
-        // So we can safely take back and `drop` the final `Box`
-        // 所以我们可以安全地拿回并 `drop` 最后的 `Box`
         let ptr = self.ptr.load(Ordering::Relaxed);
         if !ptr.is_null() {
             unsafe {

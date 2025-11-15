@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 
-use swmr_epoch::{new, Atomic};
+use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 // Benchmark 1: Mixed read-write workload (80% reads)
 fn bench_mixed_workload_80(c: &mut Criterion) {
@@ -17,19 +17,20 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (mut writer, registry) = new();
-                    let registry = Arc::new(registry);
-                    let atomic = Arc::new(Atomic::new(0u64));
+                    let domain = EpochGcDomain::new();
+                    let domain = Arc::new(domain);
+                    let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let r = registry.clone();
-                            let a = atomic.clone();
+                            let d = domain.clone();
+                            let ep = epoch_ptr.clone();
                             
                             thread::spawn(move || {
+                                let local_epoch = d.register_reader();
                                 for _ in 0..500 {
-                                    let guard = r.pin();
-                                    let _val = a.load(&guard);
+                                    let guard = local_epoch.pin();
+                                    let _val = ep.load(&guard);
                                 }
                             })
                         })
@@ -38,8 +39,6 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
                     for handle in handles {
                         let _ = handle.join();
                     }
-                    
-                    writer.try_reclaim();
                 });
             },
         );
@@ -86,19 +85,20 @@ fn bench_scalability(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (_, registry) = new();
-                    let registry = Arc::new(registry);
-                    let atomic = Arc::new(Atomic::new(0u64));
+                    let domain = EpochGcDomain::new();
+                    let domain = Arc::new(domain);
+                    let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let r = registry.clone();
-                            let a = atomic.clone();
+                            let d = domain.clone();
+                            let ep = epoch_ptr.clone();
                             
                             thread::spawn(move || {
+                                let local_epoch = d.register_reader();
                                 for _ in 0..100 {
-                                    let guard = r.pin();
-                                    let _val = a.load(&guard);
+                                    let guard = local_epoch.pin();
+                                    let _val = ep.load(&guard);
                                 }
                             })
                         })
@@ -153,13 +153,15 @@ fn bench_gc_pressure(c: &mut Criterion) {
             num_retires,
             |b, &num_retires| {
                 b.iter(|| {
-                    let (mut writer, registry) = new();
+                    let domain = EpochGcDomain::new();
+                    let mut gc = domain.gc_handle();
+                    let local_epoch = domain.register_reader();
                     
                     for i in 0..num_retires {
-                        let _guard = registry.pin();
-                        writer.retire(Box::new(i as u64));
+                        let _guard = local_epoch.pin();
+                        gc.retire(Box::new(i as u64));
                     }
-                    writer.try_reclaim();
+                    gc.collect();
                 });
             },
         );
@@ -189,10 +191,11 @@ fn bench_pin_latency(c: &mut Criterion) {
     group.sample_size(100);
     
     group.bench_function("swmr_epoch_pin_latency", |b| {
-        let (_, registry) = new();
+        let domain = EpochGcDomain::new();
+        let local_epoch = domain.register_reader();
         
         b.iter(|| {
-            let guard = registry.pin();
+            let guard = local_epoch.pin();
             black_box(&guard);
             drop(guard);
         });
@@ -216,19 +219,20 @@ fn bench_high_contention(c: &mut Criterion) {
     
     group.bench_function("swmr_epoch_high_contention", |b| {
         b.iter(|| {
-            let (_, registry) = new();
-            let registry = Arc::new(registry);
-            let atomic = Arc::new(Atomic::new(0u64));
+            let domain = EpochGcDomain::new();
+            let domain = Arc::new(domain);
+            let epoch_ptr = Arc::new(EpochPtr::new(0u64));
             
             let handles: Vec<_> = (0..16)
                 .map(|_| {
-                    let r = registry.clone();
-                    let a = atomic.clone();
+                    let d = domain.clone();
+                    let ep = epoch_ptr.clone();
                     
                     thread::spawn(move || {
+                        let local_epoch = d.register_reader();
                         for _ in 0..1000 {
-                            let guard = r.pin();
-                            let _val = a.load(&guard);
+                            let guard = local_epoch.pin();
+                            let _val = ep.load(&guard);
                         }
                     })
                 })

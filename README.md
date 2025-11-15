@@ -15,134 +15,96 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 - **Single-Writer Multi-Reader (SWMR)**: One writer thread, unlimited reader threads
 - **Epoch-Based Garbage Collection**: Deferred deletion with automatic reclamation
 - **Type-Safe**: Full Rust type safety with compile-time guarantees
-- **Atomic Pointers**: `Atomic<T>` wrapper for safe concurrent access
+- **Epoch-Protected Pointers**: `EpochPtr<T>` wrapper for safe concurrent access
 - **Zero-Copy Reads**: Readers obtain direct references without allocation
 - **Automatic Participant Cleanup**: Weak pointers automatically remove inactive readers
+- **Reentrant Pinning**: Nested pin guards supported via reference counting
 
 ## Architecture
 
 ### Core Components
 
-**Writer**
-- Single-threaded writer that advances the global epoch
-- Manages garbage collection and deferred deletion
-- Maintains participant list for tracking active readers
+**EpochGcDomain**
+- Entry point for creating an epoch-based GC system
+- Clone-safe and can be shared across threads
+- Manages the global epoch counter and reader registration
 
-**ReaderRegistry**
-- `ReaderRegistry`: Clone-safe registry for managing thread-local reader state
-- `pin()`: Pins the current thread and returns a `Guard`
-- `Guard`: RAII guard ensuring safe access during critical sections
+**GcHandle**
+- The unique garbage collector for a domain, owned by the writer thread
+- Advances the global epoch during collection cycles
+- Receives retired objects and scans active readers for reclamation
+- Not thread-safe; must be owned by a single thread
 
-**Atomic<T>**
+**LocalEpoch**
+- Reader thread's local epoch state
+- Not `Sync` (due to `Cell`) and must be stored per-thread
+- Used to pin threads and obtain `PinGuard` for safe access
+
+**PinGuard**
+- RAII guard that keeps the current thread pinned to an epoch
+- Prevents the writer from reclaiming data during the read
+- Supports cloning for nested pinning via reference counting
+- Lifetime bound to the `LocalEpoch` it came from
+
+**EpochPtr<T>**
 - Type-safe atomic pointer wrapper
-- Load operations require active `Guard`
-- Store operations trigger garbage collection
+- Load operations require active `PinGuard`
+- Store operations trigger automatic garbage collection
+- Safely manages memory across writer and reader threads
 
 ### Memory Ordering
 
 - **Acquire/Release semantics**: Ensures proper synchronization between readers and writer
-- **SeqCst for epoch advancement**: Guarantees total ordering of epoch transitions
+- **Acquire for epoch loads**: Readers synchronize with writer's epoch advances
+- **Release for epoch stores**: Writer ensures visibility to all readers
 - **Relaxed operations**: Used where ordering is not required for performance
 
 ## Usage Example
 
 ```rust
-use swmr_epoch::{new, Atomic};
+use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 fn main() {
-    let (mut writer, reader_registry) = new();
+    // 1. Create a shared GC domain
+    let domain = EpochGcDomain::new();
     
-    // Create an atomic pointer
-    let data = Atomic::new(42i32);
+    // 2. Create the unique garbage collector in the writer thread
+    let mut gc = domain.gc_handle();
     
-    // Reader thread
-    let registry_clone = reader_registry.clone();
+    // 3. Create an epoch-protected pointer
+    let data = EpochPtr::new(42i32);
+    
+    // 4. Reader thread
+    let domain_clone = domain.clone();
+    let data_clone = &data;
     let reader_thread = std::thread::spawn(move || {
-        let guard = registry_clone.pin();
-        let value = data.load(&guard);
+        let local_epoch = domain_clone.register_reader();
+        let guard = local_epoch.pin();
+        let value = data_clone.load(&guard);
         println!("Read value: {}", value);
     });
     
-    // Writer thread
-    data.store(Box::new(100), &mut writer);
-    writer.try_reclaim();
+    // 5. Writer thread: update and collect garbage
+    data.store(100, &mut gc);
+    gc.collect();
     
     reader_thread.join().unwrap();
 }
 ```
 
-## Performance Analysis
+## Core Concepts
 
-### Benchmark Results
+### Epoch
 
-All benchmarks run on a modern multi-core system. Results show median time with 95% confidence intervals.
+A logical timestamp that advances monotonically. The writer increments the epoch during garbage collection cycles. Readers "pin" themselves to an epoch, declaring that they are actively reading data from that epoch.
 
-#### 1. Single-Thread Pin/Unpin Operations
+### Pin
 
-| Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
-|-----------|-----------|-----------------|-----------|
-| Pin/Unpin | 1.63 ns | 5.57 ns | **3.42x faster** |
+When a reader calls `pin()`, it records the current epoch in its slot. This tells the writer: "I am reading data from this epoch; do not reclaim it yet."
 
-SWMR-Epoch's simplified epoch model provides significantly faster pin/unpin operations, now over 3x faster than Crossbeam.
+### Reclamation
 
-#### 2. Reader Registration (Latency)
-
-| Thread Count | SWMR-Epoch | Crossbeam-Epoch | Ratio |
-|-------------|-----------|-----------------|-------|
-| 2 threads | 72.02 µs | 78.35 µs | **1.09x faster** |
-| 4 threads | 128.11 µs | 137.77 µs | **1.08x faster** |
-| 8 threads | 239.55 µs | 251.50 µs | **1.05x faster** |
-| 16 threads | 454.38 µs | 479.11 µs | **1.05x faster** |
-
-**Performance Improvements**:
-- 2-thread performance improved to 1.09x (from 1.05x)
-- 4-thread performance improved to 1.08x (from 1.06x)
-- Overall 2-3% performance gain across thread counts
-
-#### 3. Garbage Collection Performance
-
-| Operation | SWMR-Epoch | Crossbeam-Epoch | Ratio |
-|-----------|-----------|-----------------|-------|
-| Retire 100 items | 3.18 µs | 0.94 µs | **3.38x slower** |
-| Retire 1,000 items | 29.95 µs | 14.44 µs | **2.07x slower** |
-| Retire 10,000 items | 297.00 µs | 140.87 µs | **2.11x slower** |
-
-**Performance Notes**:
-- Small batch (100 items) performance remains stable
-- Large batch (10,000 items) performance gap slightly increased (from 1.63x to 2.11x)
-
-**Optimization Opportunities**:
-- Consider batching mechanisms for small object reclamation
-- Optimize large object reclamation path
-
-#### 4. Atomic Load Operations
-
-| Benchmark | SWMR-Epoch | Crossbeam-Epoch | Advantage |
-|-----------|-----------|-----------------|-----------|
-| Load | 1.63 ns | 306.63-412.44 ns | **188-253x faster** |
-
-**Significant Improvement**:
-- Atomic load performance improved by 73-133%, from 108x to 188-253x faster
-- Demonstrates SWMR-Epoch's absolute advantage in read performance
-
-#### 5. Concurrent Reads (Throughput) ⭐ **SWMR-Epoch Leads**
-
-| Thread Count | SWMR-Epoch | Crossbeam-Epoch | Speedup |
-|-------------|-----------|-----------------|---------|
-| 2 threads | 80.84 µs | 633.65 µs | **7.84x faster** |
-| 4 threads | 134.46 µs | 1.26 ms | **9.37x faster** |
-| 8 threads | 238.35 µs | 1.29 ms | **5.41x faster** |
-
-**Key Findings**:
-- 3-7% performance improvement in 2-4 thread scenarios
-- Performance decrease in 8-thread scenario (from 13.28x to 5.41x)
-- Possible cause: Increased resource contention under high concurrency
-
-**Optimization Directions**:
-- Investigate 8-thread performance regression
-- Optimize resource contention in high-concurrency scenarios
-
-This is the primary strength of SWMR-Epoch—it's purpose-built for read-heavy concurrent workloads.
+The writer collects retired objects and reclaims those from epochs that are older than the minimum epoch of all active readers.
 
 ## Design Decisions
 
@@ -158,17 +120,24 @@ This is the primary strength of SWMR-Epoch—it's purpose-built for read-heavy c
 - **Predictable**: Deferred deletion provides bounded latency
 - **Scalable**: Reader operations are O(1) in the common case
 
-### Why Weak Pointers for Participants?
+### Why Weak Pointers for Readers?
 
 - **Automatic Cleanup**: Dropped readers are automatically removed from tracking
 - **No Explicit Unregistration**: Readers don't need to notify the writer on exit
-- **Memory Efficient**: Avoids maintaining stale participant entries
+- **Memory Efficient**: Avoids maintaining stale reader entries
+
+### Why Reentrant Pinning?
+
+- **Flexibility**: Allows nested critical sections without explicit guard management
+- **Safety**: Pin count ensures correct unpinning order
+- **Simplicity**: Developers don't need to manually track pin depth
 
 ## Limitations
 
 1. **Single Writer**: Only one thread can write at a time
-2. **GC Throughput**: Full participant scans make garbage collection slower than specialized systems
+2. **GC Throughput**: Full reader scans make garbage collection slower than specialized systems
 3. **Epoch Overflow**: Uses `usize` for epochs; overflow is theoretically possible but impractical
+4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes
 
 ## Building & Testing
 

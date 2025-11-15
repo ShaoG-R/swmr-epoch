@@ -4,16 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-// Import our SMR epoch implementation
-use swmr_epoch::{new, Atomic};
+// Import our epoch-based GC implementation
+use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 // Benchmark 1: Single-threaded pin/unpin overhead
 fn bench_single_thread_pin_unpin(c: &mut Criterion) {
     c.bench_function("swmr_epoch_single_thread_pin_unpin", |b| {
-        let (_, registry) = new();
+        let domain = EpochGcDomain::new();
+        let local_epoch = domain.register_reader();
         
         b.iter(|| {
-            let _guard = registry.pin();
+            let _guard = local_epoch.pin();
             black_box(());
         });
     });
@@ -36,14 +37,15 @@ fn bench_reader_registration(c: &mut Criterion) {
             num_readers,
             |b, &num_readers| {
                 b.iter(|| {
-                    let (_, registry) = new();
-                    let registry = Arc::new(registry);
+                    let domain = EpochGcDomain::new();
+                    let domain = Arc::new(domain);
                     
                     let handles: Vec<_> = (0..num_readers)
                         .map(|_| {
-                            let r = registry.clone();
+                            let d = domain.clone();
                             thread::spawn(move || {
-                                let _guard = r.pin();
+                                let local_epoch = d.register_reader();
+                                let _guard = local_epoch.pin();
                             })
                         })
                         .collect();
@@ -92,40 +94,17 @@ fn bench_garbage_collection(c: &mut Criterion) {
                     let mut total_duration = std::time::Duration::ZERO;
                     
                     for _ in 0..iters {
-                        let (mut writer, registry) = new();
+                        let domain = EpochGcDomain::new();
+                        let mut gc = domain.gc_handle();
+                        let local_epoch = domain.register_reader();
                         
                         let start = std::time::Instant::now();
                         
                         for i in 0..num_items {
-                            let _guard = registry.pin();
-                            writer.retire(Box::new(i as u64));
+                            let _guard = local_epoch.pin();
+                            gc.retire(Box::new(i as u64));
                         }
-                        writer.try_reclaim();
-                        
-                        total_duration += start.elapsed();
-                    }
-                    
-                    total_duration
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("crossbeam_epoch_defer", num_items),
-            num_items,
-            |b, &num_items| {
-                b.iter_custom(|iters| {
-                    let mut total_duration = std::time::Duration::ZERO;
-                    
-                    for _ in 0..iters {
-                        let start = std::time::Instant::now();
-                        let guard = crossbeam_epoch::pin();
-                        
-                        for i in 0..num_items {
-                            guard.defer(move || {
-                                let _ = i;
-                            });
-                        }
+                        gc.collect();
                         
                         total_duration += start.elapsed();
                     }
@@ -136,20 +115,32 @@ fn bench_garbage_collection(c: &mut Criterion) {
         );
     }
     
+    // NOTE: crossbeam_epoch_defer benchmark cannot be implemented fairly because:
+    // 1. crossbeam_epoch defers closures but doesn't provide explicit garbage collection API
+    // 2. Deferred closures only execute when all active pins are dropped
+    // 3. This creates a fundamental difference in GC semantics:
+    //    - swmr_epoch: explicit collect() with deterministic cleanup
+    //    - crossbeam_epoch: implicit GC tied to pin lifecycle, causing memory accumulation
+    //      during benchmark iterations if not properly managed
+    // 4. Any attempt to measure crossbeam_epoch_defer fairly would require either:
+    //    - Including GC overhead in measurements (unfair comparison)
+    //    - Forcing GC outside measurements (doesn't reflect real usage)
+    
     group.finish();
 }
 
-// Benchmark 4: Atomic pointer operations
+// Benchmark 4: Epoch pointer operations
 fn bench_atomic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_operations");
     
     group.bench_function("swmr_epoch_load", |b| {
-        let (_, registry) = new();
-        let atomic = Atomic::new(42u64);
+        let domain = EpochGcDomain::new();
+        let local_epoch = domain.register_reader();
+        let epoch_ptr = EpochPtr::new(42u64);
         
         b.iter(|| {
-            let guard = registry.pin();
-            let val = atomic.load(&guard);
+            let guard = local_epoch.pin();
+            let val = epoch_ptr.load(&guard);
             black_box(val);
         });
     });
@@ -178,21 +169,21 @@ fn bench_concurrent_reads(c: &mut Criterion) {
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (_, registry) = new();
-                    let registry = Arc::new(registry);
-                    let atomic = Arc::new(Atomic::new(0u64));
+                    let domain = EpochGcDomain::new();
+                    let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     let counter = Arc::new(AtomicUsize::new(0));
                     
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let r = registry.clone();
-                            let a = atomic.clone();
+                            let d = domain.clone();
+                            let ep = epoch_ptr.clone();
                             let c = counter.clone();
                             
                             thread::spawn(move || {
+                                let local_epoch = d.register_reader();
                                 for _ in 0..1000 {
-                                    let guard = r.pin();
-                                    let _val = a.load(&guard);
+                                    let guard = local_epoch.pin();
+                                    let _val = ep.load(&guard);
                                     c.fetch_add(1, Ordering::Relaxed);
                                 }
                             })

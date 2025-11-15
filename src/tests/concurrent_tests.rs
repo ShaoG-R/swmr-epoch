@@ -1,7 +1,7 @@
 /// 并发测试模块
 /// 测试并发场景、纪元管理和多读取者场景
 
-use crate::{new, Atomic};
+use crate::{EpochGcDomain, EpochPtr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -9,21 +9,22 @@ use std::thread;
 /// 测试1: 单个写入者，多个读取者并发读取
 #[test]
 fn test_single_writer_multiple_readers_concurrent_reads() {
-    let (_writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(0i32));
+    let domain = Arc::new(EpochGcDomain::new());
+    let ptr = Arc::new(EpochPtr::new(0i32));
     
     let mut handles = vec![];
     
     // 创建 5 个读取者线程
     for _i in 0..5 {
-        let registry_clone = registry.clone();
-        let atomic_clone = atomic.clone();
+        let domain_clone = domain.clone();
+        let ptr_clone = ptr.clone();
         
         let handle = thread::spawn(move || {
+            let local_epoch = domain_clone.register_reader();
             // 每个读取者读取 10 次
             for _ in 0..10 {
-                let guard = registry_clone.pin();
-                let value = *atomic_clone.load(&guard);
+                let guard = local_epoch.pin();
+                let value = *ptr_clone.load(&guard);
                 assert!(value >= 0);
             }
         });
@@ -40,17 +41,18 @@ fn test_single_writer_multiple_readers_concurrent_reads() {
 /// 测试2: 写入者更新，读取者观察
 #[test]
 fn test_writer_updates_readers_observe() {
-    let (mut writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(0i32));
+    let domain = Arc::new(EpochGcDomain::new());
+    let ptr = Arc::new(EpochPtr::new(0i32));
     
-    let registry_clone = registry.clone();
-    let atomic_clone = atomic.clone();
+    let domain_clone = domain.clone();
+    let ptr_clone = ptr.clone();
     
     let reader_thread = thread::spawn(move || {
+        let local_epoch = domain_clone.register_reader();
         // 读取初始值
         {
-            let guard = registry_clone.pin();
-            let value = *atomic_clone.load(&guard);
+            let guard = local_epoch.pin();
+            let value = *ptr_clone.load(&guard);
             assert_eq!(value, 0);
         }
         
@@ -59,78 +61,83 @@ fn test_writer_updates_readers_observe() {
         
         // 读取更新后的值
         {
-            let guard = registry_clone.pin();
-            let value = *atomic_clone.load(&guard);
+            let guard = local_epoch.pin();
+            let value = *ptr_clone.load(&guard);
             assert_eq!(value, 100);
         }
     });
     
     // 主线程作为写入者
     thread::sleep(std::time::Duration::from_millis(5));
-    atomic.store(Box::new(100), &mut writer);
+    let mut gc = domain.gc_handle();
+    ptr.store(100, &mut gc);
     
     reader_thread.join().unwrap();
 }
 
-/// 测试3: 多个写入者模拟（通过 Arc<Mutex<Writer>>）
+/// 测试3: 顺序写入操作
 #[test]
 fn test_sequential_writer_operations() {
-    let (mut writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(1i32));
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let local_epoch = domain.register_reader();
+    let ptr = Arc::new(EpochPtr::new(1i32));
     
     // 第一次写入
-    atomic.store(Box::new(2), &mut writer);
+    ptr.store(2, &mut gc);
     {
-        let guard = registry.pin();
-        assert_eq!(*atomic.load(&guard), 2);
+        let guard = local_epoch.pin();
+        assert_eq!(*ptr.load(&guard), 2);
     }
     
     // 第二次写入
-    atomic.store(Box::new(3), &mut writer);
+    ptr.store(3, &mut gc);
     {
-        let guard = registry.pin();
-        assert_eq!(*atomic.load(&guard), 3);
+        let guard = local_epoch.pin();
+        assert_eq!(*ptr.load(&guard), 3);
     }
     
     // 第三次写入
-    atomic.store(Box::new(4), &mut writer);
+    ptr.store(4, &mut gc);
     {
-        let guard = registry.pin();
-        assert_eq!(*atomic.load(&guard), 4);
+        let guard = local_epoch.pin();
+        assert_eq!(*ptr.load(&guard), 4);
     }
 }
 
 /// 测试4: 读取者在不同纪元中的行为
 #[test]
 fn test_readers_in_different_epochs() {
-    let (mut writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(0i32));
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let ptr = Arc::new(EpochPtr::new(0i32));
     
-    // 创建两个不同的 registry 实例来模拟不同的读取者
-    let registry2 = registry.clone();
+    // 创建两个不同的 LocalEpoch 实例来模拟不同的读取者
+    let local_epoch1 = domain.register_reader();
+    let local_epoch2 = domain.register_reader();
     
     // Reader 1 pin
-    let guard1 = registry.pin();
+    let guard1 = local_epoch1.pin();
     {
-        let value = *atomic.load(&guard1);
+        let value = *ptr.load(&guard1);
         assert_eq!(value, 0);
     }
     
     // Writer 推进纪元并更新
-    writer.try_reclaim();
-    atomic.store(Box::new(10), &mut writer);
+    gc.collect();
+    ptr.store(10, &mut gc);
     
     // Reader 2 pin（在新纪元）
-    let guard2 = registry2.pin();
+    let guard2 = local_epoch2.pin();
     {
-        let value = *atomic.load(&guard2);
+        let value = *ptr.load(&guard2);
         assert_eq!(value, 10);
     }
     
-    // Reader 1 现在也会看到新值，因为 Atomic 中的指针已经更新
+    // Reader 1 现在也会看到新值，因为 EpochPtr 中的指针已经更新
     // 纪元主要用于保护垃圾回收，而不是隔离数据可见性
     {
-        let value = *atomic.load(&guard1);
+        let value = *ptr.load(&guard1);
         assert_eq!(value, 10);
     }
 }
@@ -138,107 +145,114 @@ fn test_readers_in_different_epochs() {
 /// 测试5: 垃圾回收触发
 #[test]
 fn test_garbage_collection_trigger() {
-    let (mut writer, _registry) = new();
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
     
     // 退休数据直到触发回收
     for i in 0..70 {
-        writer.retire(Box::new(i as i32));
+        gc.retire(Box::new(i as i32));
     }
     
-    // 由于 RECLAIM_THRESHOLD = 64，第 65 个退休会触发 try_reclaim
+    // 由于 AUTO_RECLAIM_THRESHOLD = 64，第 65 个退休会触发 collect
     // 在没有活跃读取者的情况下，垃圾应该被清空
-    // 但由于没有读取者注册，垃圾可能不会完全清空
     // 只需验证垃圾数量少于退休的数据数量
-    assert!(writer.local_garbage.len() < 70);
+    assert!(gc.local_garbage.len() < 70);
 }
 
 /// 测试6: 活跃读取者保护垃圾
 #[test]
 fn test_active_reader_protects_garbage() {
-    let (mut writer, registry) = new();
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let local_epoch = domain.register_reader();
     
     // 让读取者 pin，保持活跃
-    let _guard = registry.pin();
+    let _guard = local_epoch.pin();
     
     // 退休数据直到触发回收
     for i in 0..70 {
-        writer.retire(Box::new(i as i32));
+        gc.retire(Box::new(i as i32));
     }
     
     // 由于读取者仍然活跃，垃圾不应该被完全清空
     // （至少应该保留一些垃圾）
-    assert!(writer.local_garbage.len() > 0);
+    assert!(gc.local_garbage.len() > 0);
 }
 
 /// 测试7: 读取者 drop 后垃圾被回收
 #[test]
 fn test_garbage_reclaimed_after_reader_drop() {
-    let (mut writer, registry) = new();
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let local_epoch = domain.register_reader();
     
     {
-        let _guard = registry.pin();
+        let _guard = local_epoch.pin();
         
         // 在读取者活跃时退休数据
         for i in 0..70 {
-            writer.retire(Box::new(i as i32));
+            gc.retire(Box::new(i as i32));
         }
         
         // 垃圾应该被保留
-        assert!(writer.local_garbage.len() > 0);
+        assert!(gc.local_garbage.len() > 0);
     }
     
     // 读取者 drop 后，触发一次回收
-    writer.try_reclaim();
+    gc.collect();
     
     // 现在垃圾应该被清空
-    assert_eq!(writer.local_garbage.len(), 0);
+    assert_eq!(gc.local_garbage.len(), 0);
 }
 
 /// 测试8: 多个读取者的最小纪元计算
 #[test]
 fn test_min_epoch_calculation_multiple_readers() {
-    let (mut writer, registry1) = new();
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
     
-    // 创建第二个 registry 实例来模拟不同的读取者
-    let registry2 = registry1.clone();
+    // 创建两个不同的 LocalEpoch 来模拟不同的读取者
+    let local_epoch1 = domain.register_reader();
+    let local_epoch2 = domain.register_reader();
     
     // Reader 1 在纪元 0
-    let _guard1 = registry1.pin();
+    let _guard1 = local_epoch1.pin();
     
     // 推进纪元
-    writer.try_reclaim();
+    gc.collect();
     
     // Reader 2 在纪元 1
-    let _guard2 = registry2.pin();
+    let _guard2 = local_epoch2.pin();
     
     // 退休一些数据
-    writer.retire(Box::new(100i32));
+    gc.retire(Box::new(100i32));
     
     // 再次回收，应该保留在纪元 0 之后的垃圾
-    writer.try_reclaim();
+    gc.collect();
     
     // 由于 reader1 仍在纪元 0，垃圾应该被保留
-    assert!(writer.local_garbage.len() > 0);
+    assert!(gc.local_garbage.len() > 0);
 }
 
 /// 测试9: 大量并发读取
 #[test]
 fn test_high_concurrency_reads() {
-    let (_writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(42i32));
+    let domain = Arc::new(EpochGcDomain::new());
+    let ptr = Arc::new(EpochPtr::new(42i32));
     
     let mut handles = vec![];
     
     // 创建 20 个读取者线程
     for _ in 0..20 {
-        let registry_clone = registry.clone();
-        let atomic_clone = atomic.clone();
+        let domain_clone = domain.clone();
+        let ptr_clone = ptr.clone();
         
         let handle = thread::spawn(move || {
+            let local_epoch = domain_clone.register_reader();
             // 每个读取者读取 100 次
             for _ in 0..100 {
-                let guard = registry_clone.pin();
-                let value = *atomic_clone.load(&guard);
+                let guard = local_epoch.pin();
+                let value = *ptr_clone.load(&guard);
                 assert_eq!(value, 42);
             }
         });
@@ -255,16 +269,17 @@ fn test_high_concurrency_reads() {
 /// 测试10: 读取者线程退出后的清理
 #[test]
 fn test_reader_thread_exit_cleanup() {
-    let (mut writer, registry) = new();
+    let domain = Arc::new(EpochGcDomain::new());
     
     let counter = Arc::new(AtomicUsize::new(0));
     
     {
-        let registry_clone = registry.clone();
+        let domain_clone = domain.clone();
         let counter_clone = counter.clone();
         
         let _thread = thread::spawn(move || {
-            let _guard = registry_clone.pin();
+            let local_epoch = domain_clone.register_reader();
+            let _guard = local_epoch.pin();
             counter_clone.fetch_add(1, Ordering::SeqCst);
         });
         
@@ -276,23 +291,26 @@ fn test_reader_thread_exit_cleanup() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
     
     // 触发回收，应该能清理掉已退出的读取者
-    writer.try_reclaim();
+    let mut gc = domain.gc_handle();
+    gc.collect();
 }
 
 /// 测试11: 交替的读写操作
 #[test]
 fn test_interleaved_read_write_operations() {
-    let (mut writer, registry) = new();
-    let atomic = Arc::new(Atomic::new(0i32));
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let local_epoch = domain.register_reader();
+    let ptr = Arc::new(EpochPtr::new(0i32));
     
     for i in 0..10 {
         // 写入
-        atomic.store(Box::new(i), &mut writer);
+        ptr.store(i, &mut gc);
         
         // 读取
         {
-            let guard = registry.pin();
-            let value = *atomic.load(&guard);
+            let guard = local_epoch.pin();
+            let value = *ptr.load(&guard);
             assert_eq!(value, i);
         }
     }
@@ -301,18 +319,20 @@ fn test_interleaved_read_write_operations() {
 /// 测试12: 大量垃圾回收循环
 #[test]
 fn test_heavy_garbage_collection_cycles() {
-    let (mut writer, registry) = new();
+    let domain = EpochGcDomain::new();
+    let mut gc = domain.gc_handle();
+    let local_epoch = domain.register_reader();
     
     for cycle in 0..10 {
         // 在每个循环中退休大量数据
         for i in 0..100 {
-            writer.retire(Box::new((cycle * 100 + i) as i32));
+            gc.retire(Box::new((cycle * 100 + i) as i32));
         }
         
         // 触发回收
-        writer.try_reclaim();
+        gc.collect();
         
         // 读取者仍然活跃
-        let _guard = registry.pin();
+        let _guard = local_epoch.pin();
     }
 }
