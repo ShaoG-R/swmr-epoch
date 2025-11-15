@@ -1,45 +1,43 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 
-use swmr_epoch::{new, Atomic};
+use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 // Benchmark 1: Mixed read-write workload (80% reads)
 fn bench_mixed_workload_80(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_workload_80");
     group.sample_size(10);
-    
+
     for num_threads in [2, 4, 8].iter() {
         group.bench_with_input(
             BenchmarkId::new("swmr_epoch", num_threads),
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (mut writer, registry) = new();
-                    let registry = Arc::new(registry);
-                    let atomic = Arc::new(Atomic::new(0u64));
-                    
+                    let (_gc, domain) = EpochGcDomain::new();
+                    let epoch_ptr = Arc::new(EpochPtr::new(0u64));
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let r = registry.clone();
-                            let a = atomic.clone();
-                            
+                            let d = domain.clone();
+                            let ep = epoch_ptr.clone();
+
                             thread::spawn(move || {
+                                let local_epoch = d.register_reader();
                                 for _ in 0..500 {
-                                    let guard = r.pin();
-                                    let _val = a.load(&guard);
+                                    let guard = local_epoch.pin();
+                                    let _val = ep.load(&guard);
                                 }
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
-                    
-                    writer.try_reclaim();
                 });
             },
         );
@@ -50,11 +48,11 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
             |b, &num_threads| {
                 b.iter(|| {
                     let atomic = Arc::new(crossbeam_epoch::Atomic::new(0u64));
-                    
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
                             let a = atomic.clone();
-                            
+
                             thread::spawn(move || {
                                 for _ in 0..500 {
                                     let guard = crossbeam_epoch::pin();
@@ -63,7 +61,7 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -71,7 +69,7 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -79,31 +77,31 @@ fn bench_mixed_workload_80(c: &mut Criterion) {
 fn bench_scalability(c: &mut Criterion) {
     let mut group = c.benchmark_group("scalability");
     group.sample_size(10);
-    
+
     for num_threads in [1, 2, 4, 8, 16].iter() {
         group.bench_with_input(
             BenchmarkId::new("swmr_epoch", num_threads),
             num_threads,
             |b, &num_threads| {
                 b.iter(|| {
-                    let (_, registry) = new();
-                    let registry = Arc::new(registry);
-                    let atomic = Arc::new(Atomic::new(0u64));
-                    
+                    let (_gc, domain) = EpochGcDomain::new();
+                    let epoch_ptr = Arc::new(EpochPtr::new(0u64));
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
-                            let r = registry.clone();
-                            let a = atomic.clone();
-                            
+                            let d = domain.clone();
+                            let ep = epoch_ptr.clone();
+
                             thread::spawn(move || {
+                                let local_epoch = d.register_reader();
                                 for _ in 0..100 {
-                                    let guard = r.pin();
-                                    let _val = a.load(&guard);
+                                    let guard = local_epoch.pin();
+                                    let _val = ep.load(&guard);
                                 }
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -117,11 +115,11 @@ fn bench_scalability(c: &mut Criterion) {
             |b, &num_threads| {
                 b.iter(|| {
                     let atomic = Arc::new(crossbeam_epoch::Atomic::new(0u64));
-                    
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
                             let a = atomic.clone();
-                            
+
                             thread::spawn(move || {
                                 for _ in 0..100 {
                                     let guard = crossbeam_epoch::pin();
@@ -130,7 +128,7 @@ fn bench_scalability(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -138,48 +136,7 @@ fn bench_scalability(c: &mut Criterion) {
             },
         );
     }
-    
-    group.finish();
-}
 
-// Benchmark 3: Garbage collection pressure
-fn bench_gc_pressure(c: &mut Criterion) {
-    let mut group = c.benchmark_group("gc_pressure");
-    group.sample_size(10);
-    
-    for num_retires in [100, 500, 1000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("swmr_epoch", num_retires),
-            num_retires,
-            |b, &num_retires| {
-                b.iter(|| {
-                    let (mut writer, registry) = new();
-                    
-                    for i in 0..num_retires {
-                        let _guard = registry.pin();
-                        writer.retire(Box::new(i as u64));
-                    }
-                    writer.try_reclaim();
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("crossbeam_epoch", num_retires),
-            num_retires,
-            |b, &num_retires| {
-                b.iter(|| {
-                    let guard = crossbeam_epoch::pin();
-                    for i in 0..num_retires {
-                        guard.defer(move || {
-                            let _ = i;
-                        });
-                    }
-                });
-            },
-        );
-    }
-    
     group.finish();
 }
 
@@ -187,12 +144,13 @@ fn bench_gc_pressure(c: &mut Criterion) {
 fn bench_pin_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("pin_latency");
     group.sample_size(100);
-    
+
     group.bench_function("swmr_epoch_pin_latency", |b| {
-        let (_, registry) = new();
-        
+        let (_gc, domain) = EpochGcDomain::new();
+        let local_epoch = domain.register_reader();
+
         b.iter(|| {
-            let guard = registry.pin();
+            let guard = local_epoch.pin();
             black_box(&guard);
             drop(guard);
         });
@@ -205,7 +163,7 @@ fn bench_pin_latency(c: &mut Criterion) {
             drop(guard);
         });
     });
-    
+
     group.finish();
 }
 
@@ -213,27 +171,28 @@ fn bench_pin_latency(c: &mut Criterion) {
 fn bench_high_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("high_contention");
     group.sample_size(5);
-    
+
     group.bench_function("swmr_epoch_high_contention", |b| {
         b.iter(|| {
-            let (_, registry) = new();
-            let registry = Arc::new(registry);
-            let atomic = Arc::new(Atomic::new(0u64));
-            
+            let (_gc, domain) = EpochGcDomain::new();
+            let domain = Arc::new(domain);
+            let epoch_ptr = Arc::new(EpochPtr::new(0u64));
+
             let handles: Vec<_> = (0..16)
                 .map(|_| {
-                    let r = registry.clone();
-                    let a = atomic.clone();
-                    
+                    let d = domain.clone();
+                    let ep = epoch_ptr.clone();
+
                     thread::spawn(move || {
+                        let local_epoch = d.register_reader();
                         for _ in 0..1000 {
-                            let guard = r.pin();
-                            let _val = a.load(&guard);
+                            let guard = local_epoch.pin();
+                            let _val = ep.load(&guard);
                         }
                     })
                 })
                 .collect();
-            
+
             for handle in handles {
                 let _ = handle.join();
             }
@@ -243,11 +202,11 @@ fn bench_high_contention(c: &mut Criterion) {
     group.bench_function("crossbeam_epoch_high_contention", |b| {
         b.iter(|| {
             let atomic = Arc::new(crossbeam_epoch::Atomic::new(0u64));
-            
+
             let handles: Vec<_> = (0..16)
                 .map(|_| {
                     let a = atomic.clone();
-                    
+
                     thread::spawn(move || {
                         for _ in 0..1000 {
                             let guard = crossbeam_epoch::pin();
@@ -256,13 +215,13 @@ fn bench_high_contention(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            
+
             for handle in handles {
                 let _ = handle.join();
             }
         });
     });
-    
+
     group.finish();
 }
 
@@ -270,7 +229,6 @@ criterion_group!(
     benches,
     bench_mixed_workload_80,
     bench_scalability,
-    bench_gc_pressure,
     bench_pin_latency,
     bench_high_contention
 );

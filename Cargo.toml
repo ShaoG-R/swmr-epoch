@@ -1,6 +1,6 @@
 [package]
 name = "swmr-epoch"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["ShaoG <shaog.rs@gmail.com>"]
 description = "Lock-free single-writer multi-reader epoch-based garbage collection system with atomic pointers"
@@ -12,7 +12,6 @@ keywords = ["epoch", "garbage-collection", "lock-free", "concurrent", "smr"]
 categories = ["concurrency", "memory-management", "data-structures"]
 
 [dependencies]
-crossbeam-queue = "0.3.12"
 
 [dev-dependencies]
 crossbeam-epoch = "0.9"
