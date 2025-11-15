@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ fn bench_single_thread_pin_unpin(c: &mut Criterion) {
     c.bench_function("swmr_epoch_single_thread_pin_unpin", |b| {
         let (_gc, domain) = EpochGcDomain::new();
         let local_epoch = domain.register_reader();
-        
+
         b.iter(|| {
             let _guard = local_epoch.pin();
             black_box(());
@@ -30,7 +30,7 @@ fn bench_single_thread_pin_unpin(c: &mut Criterion) {
 // Benchmark 2: Multi-threaded reader registration
 fn bench_reader_registration(c: &mut Criterion) {
     let mut group = c.benchmark_group("reader_registration");
-    
+
     for num_readers in [2, 4, 8, 16].iter() {
         group.bench_with_input(
             BenchmarkId::new("swmr_epoch", num_readers),
@@ -38,7 +38,7 @@ fn bench_reader_registration(c: &mut Criterion) {
             |b, &num_readers| {
                 b.iter(|| {
                     let (_gc, domain) = EpochGcDomain::new();
-                    
+
                     let handles: Vec<_> = (0..num_readers)
                         .map(|_| {
                             let d = domain.clone();
@@ -48,7 +48,7 @@ fn bench_reader_registration(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -68,7 +68,7 @@ fn bench_reader_registration(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -76,19 +76,19 @@ fn bench_reader_registration(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
 // Benchmark 4: Epoch pointer operations
 fn bench_atomic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_operations");
-    
+
     group.bench_function("swmr_epoch_load", |b| {
         let (_gc, domain) = EpochGcDomain::new();
         let local_epoch = domain.register_reader();
         let epoch_ptr = EpochPtr::new(42u64);
-        
+
         b.iter(|| {
             let guard = local_epoch.pin();
             let val = epoch_ptr.load(&guard);
@@ -98,14 +98,14 @@ fn bench_atomic_operations(c: &mut Criterion) {
 
     group.bench_function("crossbeam_epoch_load", |b| {
         let atomic = crossbeam_epoch::Atomic::new(42u64);
-        
+
         b.iter(|| {
             let guard = crossbeam_epoch::pin();
             let val = atomic.load(Ordering::Acquire, &guard);
             black_box(val);
         });
     });
-    
+
     group.finish();
 }
 
@@ -113,7 +113,7 @@ fn bench_atomic_operations(c: &mut Criterion) {
 fn bench_concurrent_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_reads");
     group.sample_size(10);
-    
+
     for num_threads in [2, 4, 8].iter() {
         group.bench_with_input(
             BenchmarkId::new("swmr_epoch", num_threads),
@@ -123,13 +123,13 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                     let (_gc, domain) = EpochGcDomain::new();
                     let epoch_ptr = Arc::new(EpochPtr::new(0u64));
                     let counter = Arc::new(AtomicUsize::new(0));
-                    
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
                             let d = domain.clone();
                             let ep = epoch_ptr.clone();
                             let c = counter.clone();
-                            
+
                             thread::spawn(move || {
                                 let local_epoch = d.register_reader();
                                 for _ in 0..1000 {
@@ -140,7 +140,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -155,12 +155,12 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                 b.iter(|| {
                     let atomic = Arc::new(crossbeam_epoch::Atomic::new(0u64));
                     let counter = Arc::new(AtomicUsize::new(0));
-                    
+
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {
                             let a = atomic.clone();
                             let c = counter.clone();
-                            
+
                             thread::spawn(move || {
                                 for _ in 0..1000 {
                                     let guard = crossbeam_epoch::pin();
@@ -170,7 +170,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -178,7 +178,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 

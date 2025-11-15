@@ -151,11 +151,18 @@ impl GcHandle {
             if *last_epoch == current_epoch {
                 bag.push(RetiredObject::new(data));
             } else {
-                debug_assert!(*last_epoch < current_epoch, "last_epoch: {}, current_epoch: {}", last_epoch, current_epoch);
-                self.local_garbage.push_back((current_epoch, vec![RetiredObject::new(data)]));
+                debug_assert!(
+                    *last_epoch < current_epoch,
+                    "last_epoch: {}, current_epoch: {}",
+                    last_epoch,
+                    current_epoch
+                );
+                self.local_garbage
+                    .push_back((current_epoch, vec![RetiredObject::new(data)]));
             }
         } else {
-            self.local_garbage.push_back((current_epoch, vec![RetiredObject::new(data)]));
+            self.local_garbage
+                .push_back((current_epoch, vec![RetiredObject::new(data)]));
         }
 
         self.local_garbage_count += 1;
@@ -190,20 +197,20 @@ impl GcHandle {
         let mut min_active_epoch = new_epoch;
 
         if let Ok(mut shared_readers) = self.shared.readers.lock() {
-        // 第一遍：遍历，找到最小 epoch
-        for weak_slot in shared_readers.iter() {
-            if let Some(slot) = weak_slot.upgrade() {
-                let epoch = slot.active_epoch.load(Ordering::Acquire);
-                if epoch != INACTIVE_EPOCH {
-                    min_active_epoch = min_active_epoch.min(epoch);
+            // 第一遍：遍历，找到最小 epoch
+            for weak_slot in shared_readers.iter() {
+                if let Some(slot) = weak_slot.upgrade() {
+                    let epoch = slot.active_epoch.load(Ordering::Acquire);
+                    if epoch != INACTIVE_EPOCH {
+                        min_active_epoch = min_active_epoch.min(epoch);
+                    }
                 }
             }
-        }
 
-        // 第二遍：使用 retain 原地移除已死的 readers
-        // 这样可以避免分配一个全新的 Vec
-        shared_readers.retain(|weak_slot| weak_slot.upgrade().is_some());
-    }
+            // 第二遍：使用 retain 原地移除已死的 readers
+            // 这样可以避免分配一个全新的 Vec
+            shared_readers.retain(|weak_slot| weak_slot.upgrade().is_some());
+        }
 
         let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
             usize::MAX
@@ -283,9 +290,7 @@ impl LocalEpoch {
 
         self.pin_count.set(pin_count + 1);
 
-        PinGuard {
-            reader: self,
-        }
+        PinGuard { reader: self }
     }
 }
 
@@ -357,9 +362,7 @@ impl EpochGcDomain {
             auto_reclaim_threshold: threshold,
         };
 
-        let domain = EpochGcDomain {
-            shared,
-        };
+        let domain = EpochGcDomain { shared };
 
         (gc, domain)
     }
