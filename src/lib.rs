@@ -303,6 +303,7 @@ pub struct LocalEpoch {
     slot: Arc<ReaderSlot>,
     shared: Arc<SharedState>,
     pin_count: Cell<usize>,
+    is_registered: Cell<bool>,
 }
 
 impl LocalEpoch {
@@ -330,6 +331,11 @@ impl LocalEpoch {
             self.slot
                 .active_epoch
                 .store(current_epoch, Ordering::Release);
+
+            if !self.is_registered.get() {
+                self.shared.pending_registrations.push(self.slot.clone());
+                self.is_registered.set(true);
+            }
         }
 
         self.pin_count.set(pin_count + 1);
@@ -461,12 +467,11 @@ impl EpochGcDomain {
             active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
         });
 
-        self.shared.pending_registrations.push(slot.clone());
-
         LocalEpoch {
             slot,
             shared: self.shared.clone(),
             pin_count: Cell::new(0),
+            is_registered: Cell::new(false),
         }
     }
 }
