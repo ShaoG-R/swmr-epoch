@@ -152,7 +152,6 @@ cargo bench --bench concurrent_workload
 
 ## Dependencies
 
-- `crossbeam-queue`: Lock-free queue for pending reader registrations
 - `criterion`: Benchmarking framework (dev-dependency)
 
 ## License

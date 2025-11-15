@@ -152,7 +152,6 @@ cargo bench --bench concurrent_workload
 
 ## 依赖
 
-- `crossbeam-queue`：用于待注册读取者的无锁队列
 - `criterion`：基准测试框架（开发依赖）
 
 ## 许可证
