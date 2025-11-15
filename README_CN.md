@@ -65,16 +65,13 @@
 use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 fn main() {
-    // 1. 创建共享 GC 域
-    let domain = EpochGcDomain::new();
+    // 1. 创建共享 GC 域并获取垃圾回收器
+    let (mut gc, domain) = EpochGcDomain::new();
     
-    // 2. 在写入者线程中创建唯一的垃圾回收器
-    let mut gc = domain.gc_handle();
-    
-    // 3. 创建纪元保护指针
+    // 2. 创建纪元保护指针
     let data = EpochPtr::new(42i32);
     
-    // 4. 读取者线程
+    // 3. 读取者线程
     let domain_clone = domain.clone();
     let data_clone = &data;
     let reader_thread = std::thread::spawn(move || {
@@ -84,7 +81,7 @@ fn main() {
         println!("读取值: {}", value);
     });
     
-    // 5. 写入者线程：更新并回收垃圾
+    // 4. 写入者线程：更新并回收垃圾
     data.store(100, &mut gc);
     gc.collect();
     

@@ -65,16 +65,13 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 fn main() {
-    // 1. Create a shared GC domain
-    let domain = EpochGcDomain::new();
+    // 1. Create a shared GC domain and get the garbage collector
+    let (mut gc, domain) = EpochGcDomain::new();
     
-    // 2. Create the unique garbage collector in the writer thread
-    let mut gc = domain.gc_handle();
-    
-    // 3. Create an epoch-protected pointer
+    // 2. Create an epoch-protected pointer
     let data = EpochPtr::new(42i32);
     
-    // 4. Reader thread
+    // 3. Reader thread
     let domain_clone = domain.clone();
     let data_clone = &data;
     let reader_thread = std::thread::spawn(move || {
@@ -84,7 +81,7 @@ fn main() {
         println!("Read value: {}", value);
     });
     
-    // 5. Writer thread: update and collect garbage
+    // 4. Writer thread: update and collect garbage
     data.store(100, &mut gc);
     gc.collect();
     

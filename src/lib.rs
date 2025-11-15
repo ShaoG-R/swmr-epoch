@@ -197,7 +197,6 @@ impl GcHandle {
         let mut min_active_epoch = new_epoch;
 
         if let Ok(mut shared_readers) = self.shared.readers.lock() {
-            // 第一遍：遍历，找到最小 epoch
             for weak_slot in shared_readers.iter() {
                 if let Some(slot) = weak_slot.upgrade() {
                     let epoch = slot.active_epoch.load(Ordering::Acquire);
@@ -207,8 +206,6 @@ impl GcHandle {
                 }
             }
 
-            // 第二遍：使用 retain 原地移除已死的 readers
-            // 这样可以避免分配一个全新的 Vec
             shared_readers.retain(|weak_slot| weak_slot.upgrade().is_some());
         }
 
