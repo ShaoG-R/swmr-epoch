@@ -21,12 +21,14 @@
 //!
 //! ## Typical Usage
 //!
-//! ```ignore
-//! // 1. Create a shared GC domain (can be cloned across threads)
-//! let domain = EpochGcDomain::new();
+//! ```
+//! use swmr_epoch::{EpochGcDomain, EpochPtr};
 //!
-//! // 2. Create the unique garbage collector in the writer thread
-//! let mut gc = domain.gc_handle();
+//! // 1. Create a shared GC domain and get the garbage collector
+//! let (mut gc, domain) = EpochGcDomain::new();
+//!
+//! // 2. Create an epoch-protected pointer
+//! let shared_ptr = EpochPtr::new(42i32);
 //!
 //! // 3. In each reader thread, register a local epoch
 //! let local_epoch = domain.register_reader();
@@ -38,7 +40,7 @@
 //! // guard is automatically dropped, unpinning the thread
 //!
 //! // 5. Writer updates shared data and drives garbage collection
-//! shared_ptr.store(new_value, &mut gc);
+//! shared_ptr.store(100i32, &mut gc);
 //! gc.collect();  // Reclaim garbage from old epochs
 //! ```
 
@@ -135,14 +137,23 @@ impl GcHandle {
     /// It will be reclaimed once the epoch becomes older than all active readers' epochs.
     ///
     /// This is an internal method used by `EpochPtr::store()`.
-    /// If automatic reclamation is enabled and garbage count exceeds the configured threshold,
-    /// automatic collection is triggered.
+    ///
+    /// **Automatic Reclamation**: If automatic reclamation is enabled (via `new_with_threshold()`),
+    /// and the total garbage count exceeds the configured threshold after this call,
+    /// `collect()` is automatically invoked. The default threshold is `AUTO_RECLAIM_THRESHOLD` (64).
+    /// To disable automatic reclamation, pass `None` to `new_with_threshold()`.
     ///
     /// 退休（延迟删除）一个值。
+    ///
     /// 该值被存储在与当前纪元关联的垃圾桶中。
     /// 一旦该纪元比所有活跃读者的纪元都更旧，它就会被回收。
+    ///
     /// 这是 `EpochPtr::store()` 使用的内部方法。
-    /// 如果启用了自动回收且垃圾计数超过配置的阈值，自动回收被触发。
+    ///
+    /// **自动回收**：如果启用了自动回收（通过 `new_with_threshold()`），
+    /// 且在此调用后总垃圾计数超过配置的阈值，`collect()` 会被自动调用。
+    /// 默认阈值是 `AUTO_RECLAIM_THRESHOLD`（64）。
+    /// 要禁用自动回收，请向 `new_with_threshold()` 传递 `None`。
     #[inline]
     pub(crate) fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
@@ -181,6 +192,11 @@ impl GcHandle {
     /// 2. Scans all active readers to find the minimum active epoch.
     /// 3. Reclaims garbage from epochs older than the minimum active epoch.
     ///
+    /// **Garbage Reclamation Logic**:
+    /// - If there are no active readers (min_active_epoch == new_epoch), all garbage is eligible for reclamation.
+    /// - Otherwise, garbage from epochs older than `min_active_epoch - 1` is reclaimed.
+    /// - This ensures that readers pinned to the minimum epoch can still safely access data from that epoch.
+    ///
     /// Can be called periodically or after significant updates.
     /// Safe to call even if there is no garbage to reclaim.
     ///
@@ -189,6 +205,12 @@ impl GcHandle {
     /// 1. 推进全局纪元。
     /// 2. 扫描所有活跃读者以找到最小活跃纪元。
     /// 3. 回收比最小活跃纪元更旧的纪元中的垃圾。
+    ///
+    /// **垃圾回收逻辑**：
+    /// - 如果没有活跃读者（min_active_epoch == new_epoch），所有垃圾都可以被回收。
+    /// - 否则，回收来自比 `min_active_epoch - 1` 更旧的纪元中的垃圾。
+    /// - 这确保了被钉住到最小纪元的读者仍然可以安全地访问该纪元的数据。
+    ///
     /// 可以定期调用或在重大更新后调用。
     /// 即使没有垃圾要回收也可以安全调用。
     pub fn collect(&mut self) {
@@ -262,18 +284,38 @@ impl LocalEpoch {
     /// Pin this thread to the current epoch.
     ///
     /// Returns a `PinGuard` that keeps the thread pinned for its lifetime.
-    /// This method is reentrant: multiple calls can be nested, and the thread
-    /// remains pinned until all returned guards are dropped.
+    ///
+    /// **Reentrancy**: This method is reentrant. Multiple calls can be nested, and the thread
+    /// remains pinned until all returned guards are dropped. You can also clone a guard to create
+    /// additional references: `let guard2 = guard1.clone();`
+    ///
+    /// **Example**:
+    /// ```ignore
+    /// let guard1 = local_epoch.pin();
+    /// let guard2 = local_epoch.pin();  // Reentrant call
+    /// let guard3 = guard1.clone();     // Clone for nested scope
+    /// // Thread remains pinned until all three guards are dropped
+    /// ```
     ///
     /// While pinned, the thread is considered "active" at a particular epoch,
     /// and the garbage collector will not reclaim data from that epoch.
     ///
     /// 将此线程钉住到当前纪元。
+    ///
     /// 返回一个 `PinGuard`，在其生命周期内保持线程被钉住。
-    /// 此方法是可重入的：多个调用可以嵌套，线程
-    /// 在所有返回的守卫被 drop 之前保持被钉住。
-    /// 当被钉住时，线程被认为在特定纪元"活跃"，
-    /// 垃圾回收器不会回收该纪元的数据。
+    ///
+    /// **可重入性**：此方法是可重入的。多个调用可以嵌套，线程在所有返回的守卫被 drop 之前保持被钉住。
+    /// 你也可以克隆一个守卫来创建额外的引用：`let guard2 = guard1.clone();`
+    ///
+    /// **示例**：
+    /// ```ignore
+    /// let guard1 = local_epoch.pin();
+    /// let guard2 = local_epoch.pin();  // 可重入调用
+    /// let guard3 = guard1.clone();     // 克隆用于嵌套作用域
+    /// // 线程保持被钉住直到所有三个守卫被 drop
+    /// ```
+    ///
+    /// 当被钉住时，线程被认为在特定纪元"活跃"，垃圾回收器不会回收该纪元的数据。
     #[inline]
     pub fn pin(&self) -> PinGuard<'_> {
         let pin_count = self.pin_count.get();
@@ -305,12 +347,11 @@ impl LocalEpoch {
 /// Typically, you create one domain at startup and clone it to threads that need it.
 ///
 /// **Typical Usage**:
-/// ```ignore
-/// // Main thread: create the domain
-/// let domain = EpochGcDomain::new();
+/// ```
+/// use swmr_epoch::EpochGcDomain;
 ///
-/// // Writer thread: create the garbage collector using builder pattern
-/// let (mut gc, domain) = domain.with_gc_handle().into_parts();
+/// // Main thread: create the domain and get the garbage collector
+/// let (mut gc, domain) = EpochGcDomain::new();
 ///
 /// // Reader threads: register and pin
 /// let local_epoch = domain.register_reader();
@@ -402,8 +443,8 @@ impl EpochGcDomain {
 /// While a `PinGuard` is held, the thread is considered "active" at a particular epoch,
 /// and the garbage collector will not reclaim data from that epoch.
 ///
-/// `PinGuard` can be cloned (which increments the pin count), allowing nested pinning.
-/// The thread remains pinned until all cloned guards are dropped.
+/// `PinGuard` supports internal cloning via reference counting (increments the pin count),
+/// allowing nested pinning. The thread remains pinned until all cloned guards are dropped.
 ///
 /// **Safety**: The `PinGuard` is the mechanism that ensures safe concurrent access to
 /// `EpochPtr` values. Readers must always hold a valid `PinGuard` when accessing
@@ -415,7 +456,7 @@ impl EpochGcDomain {
 /// 它的生命周期被绑定到它来自的 `LocalEpoch`。
 /// 当 `PinGuard` 被持有时，线程被认为在特定纪元"活跃"，
 /// 垃圾回收器不会回收该纪元的数据。
-/// `PinGuard` 可以被克隆（增加 pin 计数），允许嵌套 pinning。
+/// `PinGuard` 支持通过引用计数的内部克隆（增加 pin 计数），允许嵌套 pinning。
 /// 线程保持被钉住直到所有克隆的守卫被 drop。
 /// **安全性**：`PinGuard` 是确保对 `EpochPtr` 值安全并发访问的机制。
 /// 读者在通过 `EpochPtr::load()` 访问共享数据时必须始终持有有效的 `PinGuard`。
@@ -427,12 +468,21 @@ pub struct PinGuard<'a> {
 impl<'a> Clone for PinGuard<'a> {
     /// Clone this guard to create a nested pin.
     ///
-    /// Cloning increments the pin count, and the thread remains pinned
-    /// until all cloned guards are dropped.
+    /// This is an internal implementation of the `Clone` trait that enables nested pinning.
+    /// Cloning increments the pin count, and the thread remains pinned until all cloned guards
+    /// are dropped. This allows multiple scopes to hold pins simultaneously.
+    ///
+    /// **Note**: This method is automatically invoked when cloning a `PinGuard`.
+    /// Users can clone a guard directly: `let guard2 = guard1.clone();`
     ///
     /// 克隆此守卫以创建嵌套 pin。
-    /// 克隆会增加 pin 计数，线程保持被钉住
-    /// 直到所有克隆的守卫被 drop。
+    ///
+    /// 这是 `Clone` trait 的内部实现，启用嵌套 pinning。
+    /// 克隆会增加 pin 计数，线程保持被钉住直到所有克隆的守卫被 drop。
+    /// 这允许多个作用域同时持有 pin。
+    ///
+    /// **注意**：当克隆 `PinGuard` 时会自动调用此方法。
+    /// 用户可以直接克隆守卫：`let guard2 = guard1.clone();`
     #[inline]
     fn clone(&self) -> Self {
         let pin_count = self.reader.pin_count.get();
@@ -488,17 +538,21 @@ impl<'a> Drop for PinGuard<'a> {
 /// - The lifetime of the returned reference from `load()` is bound to the `PinGuard`.
 ///
 /// **Typical Usage**:
-/// ```ignore
-/// let shared = EpochPtr::new(initial_value);
+/// ```
+/// use swmr_epoch::{EpochGcDomain, EpochPtr};
+///
+/// let (mut gc, domain) = EpochGcDomain::new();
+/// let shared = EpochPtr::new(42i32);
 ///
 /// // Reader thread:
+/// let local_epoch = domain.register_reader();
 /// let guard = local_epoch.pin();
 /// let value = shared.load(&guard);
 /// // use value...
 /// drop(guard);
 ///
 /// // Writer thread:
-/// shared.store(new_value, &mut gc);
+/// shared.store(100i32, &mut gc);
 /// gc.collect();
 /// ```
 ///
@@ -528,18 +582,30 @@ impl<T: 'static> EpochPtr<T> {
 
     /// Reader load: safely read the current value.
     ///
-    /// The `guard` parameter ensures that the calling thread is pinned to an epoch,
+    /// The `guard` parameter is required for **compile-time safety verification**.
+    /// It ensures that the calling thread is pinned to an epoch,
     /// preventing the writer from reclaiming the data during the read.
-    /// The lifetime of the returned reference is bound to the guard's lifetime.
+    ///
+    /// **Compile-Time Safety**: The lifetime of the returned reference is bound to the guard's lifetime.
+    /// This is enforced by the Rust compiler, ensuring that:
+    /// - You cannot use the reference after the guard is dropped.
+    /// - The writer cannot reclaim the data while the guard (and thus the reference) is alive.
+    /// - This creates a compile-time guarantee of memory safety without runtime overhead.
     ///
     /// # Panics
-    /// This method does not panic, but the `guard` parameter is required for safety.
+    /// This method does not panic. The `guard` parameter is used only for type-level safety.
     /// If you call this without a valid `PinGuard`, you are violating the API contract.
     ///
     /// 读取者 load：安全地读取当前值。
-    /// `guard` 参数确保调用线程被钉住到一个纪元，
-    /// 防止写入者在读取期间回收数据。
-    /// 返回的引用的生命周期被绑定到守卫的生命周期。
+    ///
+    /// `guard` 参数用于**编译时安全验证**。
+    /// 它确保调用线程被钉住到一个纪元，防止写入者在读取期间回收数据。
+    ///
+    /// **编译时安全**：返回的引用的生命周期被绑定到守卫的生命周期。
+    /// 这由 Rust 编译器强制执行，确保：
+    /// - 你不能在守卫被 drop 后使用该引用。
+    /// - 当守卫（以及引用）活跃时，写入者不能回收数据。
+    /// - 这在没有运行时开销的情况下创建了内存安全的编译时保证。
     #[inline]
     pub fn load<'guard>(&self, _guard: &'guard PinGuard) -> &'guard T {
         let ptr = self.ptr.load(Ordering::Acquire);

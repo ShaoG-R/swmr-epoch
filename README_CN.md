@@ -49,7 +49,7 @@
 **EpochPtr<T>（纪元保护指针）**
 - 类型安全的原子指针包装器
 - 读取操作需要活跃的 `PinGuard`
-- 存储操作触发自动垃圾回收
+- 存储操作在垃圾计数超过配置阈值时可能触发自动垃圾回收
 - 在写入者和读取者线程间安全管理内存
 
 ### 内存排序
@@ -63,17 +63,18 @@
 
 ```rust
 use swmr_epoch::{EpochGcDomain, EpochPtr};
+use std::sync::Arc;
 
 fn main() {
     // 1. 创建共享 GC 域并获取垃圾回收器
     let (mut gc, domain) = EpochGcDomain::new();
     
-    // 2. 创建纪元保护指针
-    let data = EpochPtr::new(42i32);
+    // 2. 创建纪元保护指针，用 Arc 包装以便线程间共享
+    let data = Arc::new(EpochPtr::new(42i32));
     
     // 3. 读取者线程
     let domain_clone = domain.clone();
-    let data_clone = &data;
+    let data_clone = data.clone();
     let reader_thread = std::thread::spawn(move || {
         let local_epoch = domain_clone.register_reader();
         let guard = local_epoch.pin();
@@ -87,6 +88,38 @@ fn main() {
     
     reader_thread.join().unwrap();
 }
+```
+
+## 高级用法
+
+### 自定义垃圾回收阈值
+
+默认情况下，当垃圾计数超过 64 项时触发自动垃圾回收。你可以自定义这个值：
+
+```rust
+use swmr_epoch::EpochGcDomain;
+
+// 创建自定义阈值（例如 128 项）
+let (mut gc, domain) = EpochGcDomain::new_with_threshold(Some(128));
+
+// 或完全禁用自动回收
+let (mut gc, domain) = EpochGcDomain::new_with_threshold(None);
+gc.collect();  // 需要时手动触发回收
+```
+
+### 嵌套钉住
+
+`PinGuard` 支持克隆以实现嵌套钉住场景：
+
+```rust
+let guard1 = local_epoch.pin();
+let guard2 = guard1.clone();  // 嵌套钉住 - 线程保持被钉住
+let guard3 = guard1.clone();  // 支持多个嵌套钉住
+
+// 线程保持被钉住直到所有守卫被 drop
+drop(guard3);
+drop(guard2);
+drop(guard1);
 ```
 
 ## 核心概念
@@ -134,7 +167,7 @@ fn main() {
 1. **单写入者**：同时只有一个线程可以写入
 2. **GC 吞吐量**：完整读取者扫描使垃圾回收比专用系统慢
 3. **纪元溢出**：使用 `usize` 表示纪元；溢出理论上可能但实际不可行
-4. **自动回收**：当超过阈值时自动触发垃圾回收，可能导致延迟尖峰
+4. **自动回收**：当超过阈值时自动触发垃圾回收，可能导致延迟尖峰。可以通过向 `new_with_threshold()` 传递 `None` 来禁用，或传递不同的阈值来自定义
 
 ## 构建与测试
 

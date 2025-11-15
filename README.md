@@ -49,7 +49,7 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 **EpochPtr<T>**
 - Type-safe atomic pointer wrapper
 - Load operations require active `PinGuard`
-- Store operations trigger automatic garbage collection
+- Store operations may trigger automatic garbage collection if the garbage count exceeds the configured threshold
 - Safely manages memory across writer and reader threads
 
 ### Memory Ordering
@@ -63,17 +63,18 @@ A high-performance, lock-free garbage collection system for Rust implementing Si
 
 ```rust
 use swmr_epoch::{EpochGcDomain, EpochPtr};
+use std::sync::Arc;
 
 fn main() {
     // 1. Create a shared GC domain and get the garbage collector
     let (mut gc, domain) = EpochGcDomain::new();
     
-    // 2. Create an epoch-protected pointer
-    let data = EpochPtr::new(42i32);
+    // 2. Create an epoch-protected pointer wrapped in Arc for thread-safe sharing
+    let data = Arc::new(EpochPtr::new(42i32));
     
     // 3. Reader thread
     let domain_clone = domain.clone();
-    let data_clone = &data;
+    let data_clone = data.clone();
     let reader_thread = std::thread::spawn(move || {
         let local_epoch = domain_clone.register_reader();
         let guard = local_epoch.pin();
@@ -87,6 +88,38 @@ fn main() {
     
     reader_thread.join().unwrap();
 }
+```
+
+## Advanced Usage
+
+### Custom Garbage Collection Threshold
+
+By default, automatic garbage collection is triggered when garbage count exceeds 64 items. You can customize this:
+
+```rust
+use swmr_epoch::EpochGcDomain;
+
+// Create with custom threshold (e.g., 128 items)
+let (mut gc, domain) = EpochGcDomain::new_with_threshold(Some(128));
+
+// Or disable automatic collection entirely
+let (mut gc, domain) = EpochGcDomain::new_with_threshold(None);
+gc.collect();  // Manually trigger collection when needed
+```
+
+### Nested Pinning
+
+`PinGuard` supports cloning for nested pinning scenarios:
+
+```rust
+let guard1 = local_epoch.pin();
+let guard2 = guard1.clone();  // Nested pin - thread remains pinned
+let guard3 = guard1.clone();  // Multiple nested pins are supported
+
+// Thread remains pinned until all guards are dropped
+drop(guard3);
+drop(guard2);
+drop(guard1);
 ```
 
 ## Core Concepts
@@ -134,7 +167,7 @@ The writer collects retired objects and reclaims those from epochs that are olde
 1. **Single Writer**: Only one thread can write at a time
 2. **GC Throughput**: Full reader scans make garbage collection slower than specialized systems
 3. **Epoch Overflow**: Uses `usize` for epochs; overflow is theoretically possible but impractical
-4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes
+4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes. This can be disabled by passing `None` to `new_with_threshold()`, or customized by passing a different threshold value
 
 ## Building & Testing
 
