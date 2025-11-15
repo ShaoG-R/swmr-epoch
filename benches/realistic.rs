@@ -74,11 +74,6 @@ fn bench_realistic_swmr_workload(c: &mut Criterion) {
                         );
                         
                         total_writes.fetch_add(1, Ordering::Relaxed);
-                        
-                        // Trigger GC every 10 updates
-                        if i % 10 == 0 {
-                            gc.collect();
-                        }
                     }
 
                     running.store(false, Ordering::Relaxed);
@@ -86,9 +81,6 @@ fn bench_realistic_swmr_workload(c: &mut Criterion) {
                     for handle in reader_handles {
                         let _ = handle.join();
                     }
-                    
-                    // Final collection to ensure all garbage is reclaimed
-                    gc.collect();
                 });
             },
         );
@@ -200,25 +192,20 @@ fn bench_linked_list_reclamation(c: &mut Criterion) {
                         head = new_head;
                     }
 
-                    // Simulate removing nodes one by one
+                    // Build an EpochPtr to hold the linked list head
+                    let list_ptr = EpochPtr::new(head);
+                    
+                    // Simulate removing nodes one by one by updating the pointer
                     for _ in 0..list_size {
                         let _guard = local_epoch.pin();
+                        let current = list_ptr.load(&_guard);
                         
-                        if let Some(next) = head.next.take() {
-                            gc.retire(head);
-                            head = next;
+                        if let Some(next) = current.next.clone() {
+                            list_ptr.store(next, &mut gc);
                         } else {
-                            gc.retire(head);
                             break;
                         }
-                        
-                        // Periodic GC to test reclamation efficiency
-                        if list_size % 10 == 0 {
-                            gc.collect();
-                        }
                     }
-
-                    gc.collect();
                 });
             },
         );
@@ -284,7 +271,6 @@ fn bench_pin_lifetime_impact(c: &mut Criterion) {
     // Short-lived guards (typical case)
     group.bench_function("swmr_epoch_short_lived", |b| {
         let domain = EpochGcDomain::new();
-        let mut gc = domain.gc_handle();
         let local_epoch = domain.register_reader();
         let ptr = EpochPtr::new(42u64);
 
@@ -296,8 +282,6 @@ fn bench_pin_lifetime_impact(c: &mut Criterion) {
                 // Guard drops immediately
             }
         });
-
-        gc.collect();
     });
 
     group.bench_function("crossbeam_epoch_short_lived", |b| {
@@ -315,7 +299,6 @@ fn bench_pin_lifetime_impact(c: &mut Criterion) {
     // Long-lived guards (might block GC)
     group.bench_function("swmr_epoch_long_lived", |b| {
         let domain = EpochGcDomain::new();
-        let mut gc = domain.gc_handle();
         let local_epoch = domain.register_reader();
         let ptr = EpochPtr::new(42u64);
 
@@ -327,8 +310,6 @@ fn bench_pin_lifetime_impact(c: &mut Criterion) {
             }
             // Guard held for entire iteration
         });
-
-        gc.collect();
     });
 
     group.bench_function("crossbeam_epoch_long_lived", |b| {
@@ -362,16 +343,14 @@ fn bench_memory_pressure(c: &mut Criterion) {
                     let domain = EpochGcDomain::new();
                     let mut gc = domain.gc_handle();
                     let local_epoch = domain.register_reader();
+                    let ptr = EpochPtr::new(vec![0u8; object_size]);
 
-                    // Rapidly allocate and retire large objects
-                    for _ in 0..1000 {
+                    // Rapidly allocate and store large objects
+                    for i in 0..1000 {
                         let _guard = local_epoch.pin();
-                        let data = vec![0u8; object_size];
-                        gc.retire(Box::new(data));
+                        let data = vec![i as u8; object_size];
+                        ptr.store(data, &mut gc);
                     }
-
-                    // Force collection to measure reclamation time
-                    gc.collect();
                 });
             },
         );
@@ -446,8 +425,6 @@ fn bench_read_heavy_burst_writes(c: &mut Criterion) {
                         &mut gc,
                     );
                 }
-                
-                gc.collect();
             }
 
             running.store(false, Ordering::Relaxed);
@@ -455,8 +432,6 @@ fn bench_read_heavy_burst_writes(c: &mut Criterion) {
             for handle in reader_handles {
                 let _ = handle.join();
             }
-
-            gc.collect();
         });
     });
 

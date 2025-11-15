@@ -81,54 +81,6 @@ fn bench_reader_registration(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmark 3: Garbage collection overhead
-fn bench_garbage_collection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("garbage_collection");
-    
-    for num_items in [100, 1000, 10000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("swmr_epoch_retire", num_items),
-            num_items,
-            |b, &num_items| {
-                b.iter_custom(|iters| {
-                    let mut total_duration = std::time::Duration::ZERO;
-                    
-                    for _ in 0..iters {
-                        let domain = EpochGcDomain::new();
-                        let mut gc = domain.gc_handle();
-                        let local_epoch = domain.register_reader();
-                        
-                        let start = std::time::Instant::now();
-                        
-                        for i in 0..num_items {
-                            let _guard = local_epoch.pin();
-                            gc.retire(Box::new(i as u64));
-                        }
-                        gc.collect();
-                        
-                        total_duration += start.elapsed();
-                    }
-                    
-                    total_duration
-                });
-            },
-        );
-    }
-    
-    // NOTE: crossbeam_epoch_defer benchmark cannot be implemented fairly because:
-    // 1. crossbeam_epoch defers closures but doesn't provide explicit garbage collection API
-    // 2. Deferred closures only execute when all active pins are dropped
-    // 3. This creates a fundamental difference in GC semantics:
-    //    - swmr_epoch: explicit collect() with deterministic cleanup
-    //    - crossbeam_epoch: implicit GC tied to pin lifecycle, causing memory accumulation
-    //      during benchmark iterations if not properly managed
-    // 4. Any attempt to measure crossbeam_epoch_defer fairly would require either:
-    //    - Including GC overhead in measurements (unfair comparison)
-    //    - Forcing GC outside measurements (doesn't reflect real usage)
-    
-    group.finish();
-}
-
 // Benchmark 4: Epoch pointer operations
 fn bench_atomic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomic_operations");
@@ -235,7 +187,6 @@ criterion_group!(
     benches,
     bench_single_thread_pin_unpin,
     bench_reader_registration,
-    bench_garbage_collection,
     bench_atomic_operations,
     bench_concurrent_reads
 );

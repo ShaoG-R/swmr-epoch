@@ -142,48 +142,6 @@ fn bench_scalability(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmark 3: Garbage collection pressure
-fn bench_gc_pressure(c: &mut Criterion) {
-    let mut group = c.benchmark_group("gc_pressure");
-    group.sample_size(10);
-    
-    for num_retires in [100, 500, 1000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("swmr_epoch", num_retires),
-            num_retires,
-            |b, &num_retires| {
-                b.iter(|| {
-                    let domain = EpochGcDomain::new();
-                    let mut gc = domain.gc_handle();
-                    let local_epoch = domain.register_reader();
-                    
-                    for i in 0..num_retires {
-                        let _guard = local_epoch.pin();
-                        gc.retire(Box::new(i as u64));
-                    }
-                    gc.collect();
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("crossbeam_epoch", num_retires),
-            num_retires,
-            |b, &num_retires| {
-                b.iter(|| {
-                    let guard = crossbeam_epoch::pin();
-                    for i in 0..num_retires {
-                        guard.defer(move || {
-                            let _ = i;
-                        });
-                    }
-                });
-            },
-        );
-    }
-    
-    group.finish();
-}
 
 // Benchmark 4: Pin/Unpin latency distribution
 fn bench_pin_latency(c: &mut Criterion) {
@@ -274,7 +232,6 @@ criterion_group!(
     benches,
     bench_mixed_workload_80,
     bench_scalability,
-    bench_gc_pressure,
     bench_pin_latency,
     bench_high_contention
 );

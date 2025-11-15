@@ -145,7 +145,8 @@ impl GcHandle {
     /// 一旦该纪元比所有活跃读者的纪元都更旧，它就会被回收。
     /// 这是 `EpochPtr::store()` 使用的内部方法。
     /// 如果垃圾计数超过 `AUTO_RECLAIM_THRESHOLD`，自动回收被触发。
-    pub fn retire<T: 'static>(&mut self, data: Box<T>) {
+    #[inline]
+    pub(crate) fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
 
         self.local_garbage
@@ -177,7 +178,7 @@ impl GcHandle {
     /// 3. 回收比最小活跃纪元更旧的纪元中的垃圾。
     /// 可以定期调用或在重大更新后调用。
     /// 即使没有垃圾要回收也可以安全调用。
-    pub fn collect(&mut self) {
+    pub(crate) fn collect(&mut self) {
         let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
 
         let mut min_active_epoch = new_epoch;
@@ -323,6 +324,7 @@ pub struct EpochGcDomain {
 impl EpochGcDomain {
     /// Create a new epoch GC domain.
     /// 创建一个新的 epoch GC 域。
+    #[inline]
     pub fn new() -> Self {
         EpochGcDomain {
             shared: Arc::new(SharedState {
@@ -342,6 +344,7 @@ impl EpochGcDomain {
     /// 每个域应该恰好有一个 `GcHandle`，由写入者线程持有。
     /// 多次调用此方法会创建多个独立的句柄，
     /// 不推荐这样做，可能导致不正确的行为。
+    #[inline]
     pub fn gc_handle(&self) -> GcHandle {
         GcHandle {
             shared: self.shared.clone(),
@@ -360,6 +363,7 @@ impl EpochGcDomain {
     /// 为当前线程注册一个新的读者。
     /// 返回一个应该在每个线程中存储的 `LocalEpoch`。
     /// 调用者有责任确保每个 `LocalEpoch` 仅由一个线程使用。
+    #[inline]
     pub fn register_reader(&self) -> LocalEpoch {
         let slot = Arc::new(ReaderSlot {
             active_epoch: AtomicUsize::new(INACTIVE_EPOCH),
@@ -421,6 +425,7 @@ impl<'a> Clone for PinGuard<'a> {
     /// 克隆此守卫以创建嵌套 pin。
     /// 克隆会增加 pin 计数，线程保持被钉住
     /// 直到所有克隆的守卫被 drop。
+    #[inline]
     fn clone(&self) -> Self {
         let pin_count = self.reader.pin_count.get();
 
@@ -439,6 +444,7 @@ impl<'a> Clone for PinGuard<'a> {
 }
 
 impl<'a> Drop for PinGuard<'a> {
+    #[inline]
     fn drop(&mut self) {
         let pin_count = self.reader.pin_count.get();
 
