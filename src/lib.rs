@@ -43,7 +43,7 @@
 //! ```
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Weak;
@@ -130,7 +130,7 @@ impl GcHandleBuilder {
     pub fn into_parts(self) -> (GcHandle, EpochGcDomain) {
         let gc = GcHandle {
             shared: self.shared.clone(),
-            local_garbage: BTreeMap::new(),
+            local_garbage: VecDeque::new(),
             local_garbage_count: 0,
             readers: Vec::new(),
             auto_reclaim_threshold: self.threshold,
@@ -168,7 +168,7 @@ pub struct GcHandleCreated;
 /// **线程安全性**：`GcHandle` 不是线程安全的，必须由单个线程持有。
 pub struct GcHandle {
     shared: Arc<SharedState>,
-    local_garbage: BTreeMap<usize, Vec<RetiredNode>>,
+    local_garbage: VecDeque<(usize, Vec<RetiredNode>)>,
     local_garbage_count: usize,
     readers: Vec<Weak<ReaderSlot>>,
     auto_reclaim_threshold: Option<usize>,
@@ -198,10 +198,16 @@ impl GcHandle {
     pub(crate) fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
 
-        self.local_garbage
-            .entry(current_epoch)
-            .or_default()
-            .push(RetiredObject::new(data));
+        if let Some((last_epoch, bag)) = self.local_garbage.back_mut() {
+            if *last_epoch == current_epoch {
+                bag.push(RetiredObject::new(data));
+            } else {
+                debug_assert!(*last_epoch < current_epoch, "last_epoch: {}, current_epoch: {}", last_epoch, current_epoch);
+                self.local_garbage.push_back((current_epoch, vec![RetiredObject::new(data)]));
+            }
+        } else {
+            self.local_garbage.push_back((current_epoch, vec![RetiredObject::new(data)]));
+        }
 
         self.local_garbage_count += 1;
 
@@ -263,14 +269,18 @@ impl GcHandle {
 
         let mut retained_count = 0;
 
-        self.local_garbage.retain(|&epoch, bag| {
-            if epoch > safe_to_reclaim_epoch {
+        while let Some((epoch, bag)) = self.local_garbage.front() {
+            if *epoch > safe_to_reclaim_epoch {
                 retained_count += bag.len();
-                true
+                break;
             } else {
-                false
+                self.local_garbage.pop_front();
             }
-        });
+        }
+
+        for (_, bag) in self.local_garbage.iter() {
+            retained_count += bag.len();
+        }
 
         self.local_garbage_count = retained_count;
     }
