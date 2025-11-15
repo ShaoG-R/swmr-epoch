@@ -25,7 +25,3 @@ harness = false
 [[bench]]
 name = "concurrent_workload"
 harness = false
-
-[[bench]]
-name = "realistic"
-harness = false

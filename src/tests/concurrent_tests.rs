@@ -9,7 +9,9 @@ use std::thread;
 /// 测试1: 单个写入者，多个读取者并发读取
 #[test]
 fn test_single_writer_multiple_readers_concurrent_reads() {
-    let domain = Arc::new(EpochGcDomain::new());
+    let domain = EpochGcDomain::new();
+    let (mut _gc, domain) = domain.with_gc_handle().into_parts();
+    let domain = Arc::new(domain);
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     let mut handles = vec![];
@@ -41,7 +43,9 @@ fn test_single_writer_multiple_readers_concurrent_reads() {
 /// 测试2: 写入者更新，读取者观察
 #[test]
 fn test_writer_updates_readers_observe() {
-    let domain = Arc::new(EpochGcDomain::new());
+    let domain = EpochGcDomain::new();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    let domain = Arc::new(domain);
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     let domain_clone = domain.clone();
@@ -69,7 +73,6 @@ fn test_writer_updates_readers_observe() {
     
     // 主线程作为写入者
     thread::sleep(std::time::Duration::from_millis(5));
-    let mut gc = domain.gc_handle();
     ptr.store(100, &mut gc);
     
     reader_thread.join().unwrap();
@@ -79,7 +82,7 @@ fn test_writer_updates_readers_observe() {
 #[test]
 fn test_sequential_writer_operations() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = Arc::new(EpochPtr::new(1i32));
     
@@ -109,7 +112,7 @@ fn test_sequential_writer_operations() {
 #[test]
 fn test_readers_in_different_epochs() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     // 创建两个不同的 LocalEpoch 实例来模拟不同的读取者
@@ -146,7 +149,7 @@ fn test_readers_in_different_epochs() {
 #[test]
 fn test_garbage_collection_trigger() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
     
     // 退休数据直到触发回收
     for i in 0..70 {
@@ -163,7 +166,7 @@ fn test_garbage_collection_trigger() {
 #[test]
 fn test_active_reader_protects_garbage() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     // 让读取者 pin，保持活跃
@@ -183,7 +186,7 @@ fn test_active_reader_protects_garbage() {
 #[test]
 fn test_garbage_reclaimed_after_reader_drop() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     {
@@ -209,7 +212,7 @@ fn test_garbage_reclaimed_after_reader_drop() {
 #[test]
 fn test_min_epoch_calculation_multiple_readers() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     
     // 创建两个不同的 LocalEpoch 来模拟不同的读取者
     let local_epoch1 = domain.register_reader();
@@ -237,7 +240,9 @@ fn test_min_epoch_calculation_multiple_readers() {
 /// 测试9: 大量并发读取
 #[test]
 fn test_high_concurrency_reads() {
-    let domain = Arc::new(EpochGcDomain::new());
+    let domain = EpochGcDomain::new();
+    let (mut _gc, domain) = domain.with_gc_handle().into_parts();
+    let domain = Arc::new(domain);
     let ptr = Arc::new(EpochPtr::new(42i32));
     
     let mut handles = vec![];
@@ -269,7 +274,9 @@ fn test_high_concurrency_reads() {
 /// 测试10: 读取者线程退出后的清理
 #[test]
 fn test_reader_thread_exit_cleanup() {
-    let domain = Arc::new(EpochGcDomain::new());
+    let domain = EpochGcDomain::new();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
+    let domain = Arc::new(domain);
     
     let counter = Arc::new(AtomicUsize::new(0));
     
@@ -291,7 +298,6 @@ fn test_reader_thread_exit_cleanup() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
     
     // 触发回收，应该能清理掉已退出的读取者
-    let mut gc = domain.gc_handle();
     gc.collect();
 }
 
@@ -299,7 +305,7 @@ fn test_reader_thread_exit_cleanup() {
 #[test]
 fn test_interleaved_read_write_operations() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
@@ -320,7 +326,7 @@ fn test_interleaved_read_write_operations() {
 #[test]
 fn test_heavy_garbage_collection_cycles() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     for cycle in 0..10 {

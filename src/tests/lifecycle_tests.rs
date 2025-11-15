@@ -10,7 +10,7 @@ use std::thread;
 #[test]
 fn test_guard_lifetime_constraint() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = EpochPtr::new(42i32);
     
@@ -27,7 +27,7 @@ fn test_guard_lifetime_constraint() {
 #[test]
 fn test_multiple_guards_simultaneously_active() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = EpochPtr::new(42i32);
     
@@ -45,7 +45,7 @@ fn test_multiple_guards_simultaneously_active() {
 #[test]
 fn test_guard_nested_scopes() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = EpochPtr::new(42i32);
     
@@ -70,7 +70,7 @@ fn test_guard_nested_scopes() {
 #[test]
 fn test_reader_isolation_across_threads() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let domain = Arc::new(domain);
     let ptr = Arc::new(EpochPtr::new(0i32));
     
@@ -104,7 +104,7 @@ fn test_reader_isolation_across_threads() {
 #[test]
 fn test_writer_single_threaded_constraint() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
     
     // GcHandle 不能被克隆或共享
     gc.retire(Box::new(42i32));
@@ -117,7 +117,7 @@ fn test_writer_single_threaded_constraint() {
 #[test]
 fn test_garbage_collection_memory_safety() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     // 创建一些数据
@@ -153,7 +153,7 @@ fn test_epoch_ptr_drop_implementation() {
 #[test]
 fn test_multiple_epoch_ptr_independence() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     let ptr1 = EpochPtr::new(10i32);
@@ -177,7 +177,7 @@ fn test_multiple_epoch_ptr_independence() {
 #[test]
 fn test_domain_clone_safety() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     
     // 克隆 domain 创建多个实例
     let domain1 = domain.clone();
@@ -197,7 +197,7 @@ fn test_domain_clone_safety() {
 #[test]
 fn test_epoch_advancement_correctness() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
@@ -226,7 +226,7 @@ fn test_epoch_advancement_correctness() {
 #[test]
 fn test_concurrent_read_consistency() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let domain = Arc::new(domain);
     let ptr = Arc::new(EpochPtr::new(42i32));
     
@@ -265,7 +265,7 @@ fn test_concurrent_read_consistency() {
 #[test]
 fn test_reader_exit_cleanup() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let domain = Arc::new(domain);
     
     let reader_count = Arc::new(AtomicUsize::new(0));
@@ -294,7 +294,7 @@ fn test_reader_exit_cleanup() {
 #[test]
 fn test_large_garbage_safe_reclamation() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
     
     // 退休大量数据
     for i in 0..1000 {
@@ -317,7 +317,7 @@ fn test_complex_type_lifetime_management() {
     }
     
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     let data = ComplexData {
@@ -341,7 +341,7 @@ fn test_complex_type_lifetime_management() {
 #[test]
 fn test_data_visibility_across_epochs() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let ptr = Arc::new(EpochPtr::new(0i32));
     
     // 创建两个读取者
@@ -378,7 +378,7 @@ fn test_data_visibility_across_epochs() {
 #[test]
 fn test_rapid_reader_switching() {
     let domain = EpochGcDomain::new();
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     let ptr = Arc::new(EpochPtr::new(42i32));
     
@@ -402,7 +402,7 @@ fn test_rapid_reader_switching() {
 #[test]
 fn test_writer_garbage_management() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     // 第一轮：退休数据，读取者活跃
@@ -425,7 +425,7 @@ fn test_writer_garbage_management() {
 #[test]
 fn test_multiple_readers_garbage_protection() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     
     // 创建多个读取者
     let local_epoch1 = domain.register_reader();
@@ -449,7 +449,7 @@ fn test_multiple_readers_garbage_protection() {
 #[test]
 fn test_complete_lifecycle_scenario() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let ptr = Arc::new(EpochPtr::new(String::from("initial")));
     
     // 创建多个读取者

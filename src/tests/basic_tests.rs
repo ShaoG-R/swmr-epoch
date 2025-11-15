@@ -9,7 +9,7 @@ fn test_create_gc_handle_and_local_epoch() {
     let domain = EpochGcDomain::new();
     
     // 验证 GcHandle 被成功创建
-    let _gc = domain.gc_handle();
+    let (_gc, domain) = domain.with_gc_handle().into_parts();
     
     // 验证 LocalEpoch 被成功创建
     let local_epoch = domain.register_reader();
@@ -66,7 +66,7 @@ fn test_epoch_ptr_create_and_load() {
 #[test]
 fn test_writer_store() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, domain) = domain.with_gc_handle().into_parts();
     let local_epoch = domain.register_reader();
     
     let ptr = EpochPtr::new(10i32);
@@ -93,7 +93,7 @@ fn test_writer_store() {
 #[test]
 fn test_writer_collect() {
     let domain = EpochGcDomain::new();
-    let mut gc = domain.gc_handle();
+    let (mut gc, _domain) = domain.with_gc_handle().into_parts();
     
     // 退休一些数据
     gc.retire(Box::new(100i32));
