@@ -1,4 +1,4 @@
-# SWMR-Epoch: Lock-Free Single-Writer Multi-Reader Epoch-Based GC
+# SWMR-Epoch: Single-Writer Multi-Reader Epoch-Based GC with Minimal Locking
 
 [![Crates.io](https://img.shields.io/crates/v/swmr-epoch.svg)](https://crates.io/crates/swmr-epoch)
 [![License](https://img.shields.io/crates/l/swmr-epoch.svg)](https://github.com/ShaoG-R/swmr-epoch#license)
@@ -7,11 +7,11 @@
 
 [中文文档](./README_CN.md)
 
-A high-performance, lock-free garbage collection system for Rust implementing Single-Writer Multi-Reader (SWMR) epoch-based memory reclamation. Designed for concurrent data structures requiring safe, efficient memory management without locks.
+A high-performance garbage collection system for Rust implementing Single-Writer Multi-Reader (SWMR) epoch-based memory reclamation. Designed for concurrent data structures requiring safe, efficient memory management. Uses minimal locking (a single Mutex for reader tracking) combined with atomic operations for the core epoch mechanism.
 
 ## Features
 
-- **Lock-Free Design**: No mutexes or locks—purely atomic operations and memory ordering
+- **Minimal Locking**: Uses a single Mutex only for reader registration tracking; atomic operations for core epoch mechanism
 - **Single-Writer Multi-Reader (SWMR)**: One writer thread, unlimited reader threads
 - **Epoch-Based Garbage Collection**: Deferred deletion with automatic reclamation
 - **Type-Safe**: Full Rust type safety with compile-time guarantees
@@ -141,14 +141,14 @@ The writer collects retired objects and reclaims those from epochs that are olde
 ### Why SWMR?
 
 - **Simplicity**: Single writer eliminates write-write conflicts and complex synchronization
-- **Performance**: Readers never block readers; writer operations are predictable
+- **Performance**: Readers don't block each other during normal reads; writer operations are predictable
 - **Safety**: Easier to reason about correctness with one writer
 
 ### Why Epoch-Based GC?
 
-- **Lock-Free**: No need for reference counting or atomic CAS loops
+- **Minimal Synchronization**: Epoch mechanism uses atomic operations; only reader tracking uses a Mutex during collection
 - **Predictable**: Deferred deletion provides bounded latency
-- **Scalable**: Reader operations are O(1) in the common case
+- **Scalable**: Reader operations are O(1) in the common case (no CAS loops or reference counting overhead)
 
 ### Why Weak Pointers for Readers?
 
@@ -168,6 +168,7 @@ The writer collects retired objects and reclaims those from epochs that are olde
 2. **GC Throughput**: Full reader scans make garbage collection slower than specialized systems
 3. **Epoch Overflow**: Uses `usize` for epochs; overflow is theoretically possible but impractical
 4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes. This can be disabled by passing `None` to `new_with_threshold()`, or customized by passing a different threshold value
+5. **Reader Tracking Mutex**: A single Mutex is used to track active readers during garbage collection. While this is a minimal synchronization point, it is not fully lock-free. Performance testing showed that lock-free alternatives (e.g., SegQueue) resulted in worse performance due to contention and memory ordering overhead
 
 ## Building & Testing
 
