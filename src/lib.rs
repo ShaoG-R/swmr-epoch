@@ -44,10 +44,22 @@
 //! gc.collect();  // Reclaim garbage from old epochs
 //! ```
 
+#[cfg(loom)]
+use loom::cell::Cell;
+#[cfg(not(loom))]
 use std::cell::Cell;
-use std::collections::VecDeque;
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+
+#[cfg(loom)]
+use loom::sync::{Arc, Mutex};
+#[cfg(not(loom))]
+use std::sync::{Arc, Mutex};
+
+use std::collections::VecDeque;
 
 const AUTO_RECLAIM_THRESHOLD: usize = 64;
 const DEFAULT_CLEANUP_INTERVAL: usize = 16;
@@ -99,7 +111,7 @@ struct ReaderSlot {
 #[derive(Debug)]
 struct SharedState {
     global_epoch: AtomicUsize,
-    readers: Mutex<Vec<Weak<ReaderSlot>>>,
+    readers: Mutex<Vec<Arc<ReaderSlot>>>,
 }
 
 /// The unique garbage collector handle for an epoch GC domain.
@@ -224,24 +236,28 @@ impl GcHandle {
         
         let should_cleanup = self.cleanup_interval > 0 && self.collection_counter % self.cleanup_interval == 0;
 
-        if let Ok(mut shared_readers) = self.shared.readers.lock() {
-            let mut dead_count = 0;
-            
-            for weak_slot in shared_readers.iter() {
-                if let Some(slot) = weak_slot.upgrade() {
-                    let epoch = slot.active_epoch.load(Ordering::Acquire);
-                    if epoch != INACTIVE_EPOCH {
-                        min_active_epoch = min_active_epoch.min(epoch);
-                    }
-                } else if should_cleanup {
-                    dead_count += 1;
-                }
-            }
-
-            if should_cleanup && dead_count > 0 {
-                shared_readers.retain(|weak_slot| weak_slot.strong_count() > 0);
+        let mut shared_readers = self.shared.readers.lock()
+            .expect("Failed to acquire readers lock in collect: mutex poisoned");
+        
+        let mut dead_count = 0;
+        
+        for arc_slot in shared_readers.iter() {
+            let epoch = arc_slot.active_epoch.load(Ordering::Acquire);
+            if epoch != INACTIVE_EPOCH {
+                min_active_epoch = min_active_epoch.min(epoch);
+            } else if should_cleanup && Arc::strong_count(arc_slot) == 1 {
+                // Only this Vec holds a reference, the LocalEpoch was dropped
+                dead_count += 1;
             }
         }
+
+        if should_cleanup && dead_count > 0 {
+            // Keep only slots that have external references (strong_count > 1)
+            shared_readers.retain(|arc_slot| Arc::strong_count(arc_slot) > 1);
+        }
+        
+        // Explicitly drop the lock before proceeding to garbage collection
+        drop(shared_readers);
 
         let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
             usize::MAX
@@ -521,10 +537,9 @@ impl EpochGcDomain {
         });
 
         // Register the reader immediately in the shared readers list
-        let weak_slot = Arc::downgrade(&slot);
-        if let Ok(mut readers) = self.shared.readers.lock() {
-            readers.push(weak_slot);
-        }
+        self.shared.readers.lock()
+            .expect("Failed to acquire readers lock in register_reader: mutex poisoned")
+            .push(Arc::clone(&slot));
 
         LocalEpoch {
             slot,
