@@ -259,18 +259,25 @@ impl GcHandle {
         // Explicitly drop the lock before proceeding to garbage collection
         drop(shared_readers);
 
-        let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
-            usize::MAX
-        } else {
-            min_active_epoch.saturating_sub(1)
-        };
-
-        while let Some((epoch, _)) = self.local_garbage.front() {
-            if *epoch > safe_to_reclaim_epoch {
-                break;
+        // 回收垃圾：只回收严格早于 min_active_epoch 的 epoch 的垃圾
+        // Reclaim garbage: only reclaim from epochs strictly before min_active_epoch
+        if min_active_epoch == new_epoch {
+            // 没有活跃读者，回收所有垃圾
+            // No active readers, reclaim all garbage
+            self.local_garbage.clear();
+        } else if min_active_epoch > 0 {
+            // 回收 epoch < min_active_epoch 的垃圾
+            // Reclaim garbage from epochs < min_active_epoch
+            let safe_to_reclaim_epoch = min_active_epoch - 1;
+            while let Some((epoch, _)) = self.local_garbage.front() {
+                if *epoch > safe_to_reclaim_epoch {
+                    break;
+                }
+                self.local_garbage.pop_front();
             }
-            self.local_garbage.pop_front();
         }
+        // 如果 min_active_epoch == 0，不回收任何垃圾
+        // If min_active_epoch == 0, don't reclaim any garbage
 
         self.local_garbage_count = self.local_garbage.iter()
             .map(|(_, bag)| bag.len())

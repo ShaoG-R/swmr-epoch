@@ -1,6 +1,6 @@
 [package]
 name = "swmr-epoch"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 authors = ["ShaoG <shaog.rs@gmail.com>"]
 description = "Lock-free single-writer multi-reader epoch-based garbage collection system with atomic pointers"
