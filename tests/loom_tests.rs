@@ -823,6 +823,55 @@ fn loom_reader_monotonic_observation() {
     });
 }
 
+
+/// Test: Reader holds guard while writer performs multiple updates
+/// 测试：读取者在写入者执行多次更新时持有 guard
+#[test]
+fn loom_reader_holds_guard_during_updates() {
+    loom::model(|| {
+        let (mut gc, domain) = EpochGcDomain::new();
+        let ptr = Arc::new(EpochPtr::new(0i32));
+
+        let reader_domain = domain.clone();
+        let reader_ptr = Arc::clone(&ptr);
+        
+        let reader = thread::spawn(move || {
+            let local = reader_domain.register_reader();
+            // Hold a guard and a reference for a while
+            // 持有 guard 和引用一段时间
+            let guard = local.pin();
+            // Get a reference to the current value
+            // 获取当前值的引用
+            let value_ref = reader_ptr.load(&guard);
+            let initial_value = *value_ref;
+            
+            // Yield to allow writer to proceed
+            // 让步以允许写入者继续
+            thread::yield_now();
+            thread::yield_now();
+            
+            // The same reference should still be valid and consistent
+            // even though writer has updated the pointer
+            // 即使写入者已更新指针，相同的引用仍应有效且一致
+            let same_value = *value_ref;
+            assert_eq!(same_value, initial_value);
+            
+            // Value should be in valid range
+            // 值应在有效范围内
+            assert!(initial_value >= 0 && initial_value <= 3);
+        });
+
+        // Writer performs multiple updates
+        // 写入者执行多次更新
+        ptr.store(1i32, &mut gc);
+        ptr.store(2i32, &mut gc);
+        ptr.store(3i32, &mut gc);
+
+        reader.join().unwrap();
+    });
+}
+
+
 /// Test: Builder with custom cleanup interval
 #[test]
 fn loom_builder_custom_cleanup_interval() {

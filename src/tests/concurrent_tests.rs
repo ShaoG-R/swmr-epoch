@@ -325,3 +325,43 @@ fn test_heavy_garbage_collection_cycles() {
         let _guard = local_epoch.pin();
     }
 }
+
+/// 测试13: 读取者在写入者更新时持有 guard
+/// Test reader holds guard while writer updates
+#[test]
+fn test_reader_holds_guard_during_updates() {
+    let (mut gc, domain) = EpochGcDomain::new();
+    let ptr = Arc::new(EpochPtr::new(0));
+    let num_updates = 50;
+
+    let domain_clone = domain.clone();
+    let ptr_clone = ptr.clone();
+
+    // Reader thread: holds guard and a reference for a while
+    let reader = thread::spawn(move || {
+        let reader_epoch = domain_clone.register_reader();
+        // Hold a guard for a while
+        // 持有 guard 一段时间
+        let guard = reader_epoch.pin();
+        // Get a reference to the current value
+        // 获取当前值的引用
+        let value_ref = ptr_clone.load(&guard);
+        let initial_value = *value_ref;
+        thread::sleep(std::time::Duration::from_millis(10));
+        // The same reference should still be valid and consistent
+        // even though writer has updated the pointer
+        // 即使写入者已更新指针，相同的引用仍应有效且一致
+        assert_eq!(*value_ref, initial_value);
+        // Value should be in valid range
+        // 值应在有效范围内
+        assert!(initial_value >= 0 && initial_value <= num_updates);
+    });
+
+    // Writer on main thread: performs multiple updates
+    // 主线程上的写入者：执行多次更新
+    for i in 1..=num_updates {
+        ptr.store(i, &mut gc);
+    }
+
+    reader.join().unwrap();
+}
