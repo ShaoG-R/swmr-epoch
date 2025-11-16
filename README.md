@@ -92,20 +92,29 @@ fn main() {
 
 ## Advanced Usage
 
-### Custom Garbage Collection Threshold
+### Configuring with Builder Pattern
 
-By default, automatic garbage collection is triggered when garbage count exceeds 64 items. You can customize this:
+Use the builder pattern to customize GC behavior:
 
 ```rust
 use swmr_epoch::EpochGcDomain;
 
-// Create with custom threshold (e.g., 128 items)
-let (mut gc, domain) = EpochGcDomain::new_with_threshold(Some(128));
+// Configure with builder pattern
+let (mut gc, domain) = EpochGcDomain::builder()
+    .auto_reclaim_threshold(128)    // Trigger collection at 128 items
+    .cleanup_interval(32)            // Clean up dead readers every 32 collections
+    .build();
 
-// Or disable automatic collection entirely
-let (mut gc, domain) = EpochGcDomain::new_with_threshold(None);
+// Disable automatic collection entirely
+let (mut gc, domain) = EpochGcDomain::builder()
+    .auto_reclaim_threshold(None)   // No automatic collection
+    .build();
 gc.collect();  // Manually trigger collection when needed
 ```
+
+**Configuration Options**:
+- `auto_reclaim_threshold(n)`: Trigger automatic GC when garbage count exceeds `n` (default: 64). Pass `None` to disable.
+- `cleanup_interval(n)`: Clean up dead reader slots every `n` collection cycles (default: 16)
 
 ### Nested Pinning
 
@@ -149,6 +158,7 @@ The writer collects retired objects and reclaims those from epochs that are olde
 - **Minimal Synchronization**: Epoch mechanism uses atomic operations; only reader tracking uses a Mutex during collection
 - **Predictable**: Deferred deletion provides bounded latency
 - **Scalable**: Reader operations are O(1) in the common case (no CAS loops or reference counting overhead)
+- **Optimized Collection**: Batch cleanup of dead readers reduces per-collection overhead
 
 ### Why Weak Pointers for Readers?
 
@@ -165,10 +175,10 @@ The writer collects retired objects and reclaims those from epochs that are olde
 ## Limitations
 
 1. **Single Writer**: Only one thread can write at a time
-2. **GC Throughput**: Full reader scans make garbage collection slower than specialized systems
+2. **GC Throughput**: Reader scans during collection; performance optimized via batched cleanup of dead reader slots
 3. **Epoch Overflow**: Uses `usize` for epochs; overflow is theoretically possible but impractical
-4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes. This can be disabled by passing `None` to `new_with_threshold()`, or customized by passing a different threshold value
-5. **Reader Tracking Mutex**: A single Mutex is used to track active readers during garbage collection. While this is a minimal synchronization point, it is not fully lock-free. Performance testing showed that lock-free alternatives (e.g., SegQueue) resulted in worse performance due to contention and memory ordering overhead
+4. **Automatic Reclamation**: Garbage collection is triggered automatically when threshold is exceeded, which may cause latency spikes. This can be disabled or customized using the builder pattern
+5. **Reader Tracking Mutex**: A single Mutex is used to track active readers during garbage collection. While this is a minimal synchronization point, it is not fully lock-free. Performance testing showed that lock-free alternatives (e.g., SegQueue) resulted in worse performance due to contention and memory ordering overhead. To minimize overhead, dead reader cleanup is batched (configurable via `cleanup_interval` in the builder)
 
 ## Building & Testing
 

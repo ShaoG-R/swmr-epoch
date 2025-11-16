@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "concurrent_workload"
 harness = false
+
+[[bench]]
+name = "manual_collection"
+harness = false

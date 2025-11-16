@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const AUTO_RECLAIM_THRESHOLD: usize = 64;
+const DEFAULT_CLEANUP_INTERVAL: usize = 16;
 const INACTIVE_EPOCH: usize = usize::MAX;
 
 type RetiredNode = RetiredObject;
@@ -123,6 +124,8 @@ pub struct GcHandle {
     local_garbage: VecDeque<(usize, Vec<RetiredNode>)>,
     local_garbage_count: usize,
     auto_reclaim_threshold: Option<usize>,
+    collection_counter: usize,
+    cleanup_interval: usize,
 }
 
 impl GcHandle {
@@ -217,18 +220,27 @@ impl GcHandle {
         let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
 
         let mut min_active_epoch = new_epoch;
+        self.collection_counter += 1;
+        
+        let should_cleanup = self.cleanup_interval > 0 && self.collection_counter % self.cleanup_interval == 0;
 
         if let Ok(mut shared_readers) = self.shared.readers.lock() {
+            let mut dead_count = 0;
+            
             for weak_slot in shared_readers.iter() {
                 if let Some(slot) = weak_slot.upgrade() {
                     let epoch = slot.active_epoch.load(Ordering::Acquire);
                     if epoch != INACTIVE_EPOCH {
                         min_active_epoch = min_active_epoch.min(epoch);
                     }
+                } else if should_cleanup {
+                    dead_count += 1;
                 }
             }
 
-            shared_readers.retain(|weak_slot| weak_slot.upgrade().is_some());
+            if should_cleanup && dead_count > 0 {
+                shared_readers.retain(|weak_slot| weak_slot.strong_count() > 0);
+            }
         }
 
         let safe_to_reclaim_epoch = if min_active_epoch == new_epoch {
@@ -237,22 +249,16 @@ impl GcHandle {
             min_active_epoch.saturating_sub(1)
         };
 
-        let mut retained_count = 0;
-
-        while let Some((epoch, bag)) = self.local_garbage.front() {
+        while let Some((epoch, _)) = self.local_garbage.front() {
             if *epoch > safe_to_reclaim_epoch {
-                retained_count += bag.len();
                 break;
-            } else {
-                self.local_garbage.pop_front();
             }
+            self.local_garbage.pop_front();
         }
 
-        for (_, bag) in self.local_garbage.iter() {
-            retained_count += bag.len();
-        }
-
-        self.local_garbage_count = retained_count;
+        self.local_garbage_count = self.local_garbage.iter()
+            .map(|(_, bag)| bag.len())
+            .sum();
     }
 }
 
@@ -333,6 +339,105 @@ impl LocalEpoch {
     }
 }
 
+/// Builder for configuring an `EpochGcDomain`.
+///
+/// Use this builder to customize garbage collection behavior:
+/// - `auto_reclaim_threshold`: Set garbage count threshold for automatic collection
+/// - `cleanup_interval`: Set how often to cleanup dead reader slots
+///
+/// # Example
+/// ```
+/// use swmr_epoch::EpochGcDomain;
+///
+/// let (gc, domain) = EpochGcDomain::builder()
+///     .auto_reclaim_threshold(128)
+///     .cleanup_interval(32)
+///     .build();
+/// ```
+///
+/// 用于配置 `EpochGcDomain` 的构建器。
+pub struct EpochGcDomainBuilder {
+    auto_reclaim_threshold: Option<usize>,
+    cleanup_interval: usize,
+}
+
+impl EpochGcDomainBuilder {
+    /// Create a new builder with default settings.
+    /// 创建一个带有默认设置的新构建器。
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            auto_reclaim_threshold: Some(AUTO_RECLAIM_THRESHOLD),
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+        }
+    }
+
+    /// Set the automatic reclamation threshold.
+    ///
+    /// When garbage count exceeds this threshold, `collect()` is automatically called.
+    /// Pass `None` to disable automatic reclamation.
+    ///
+    /// Default: `Some(64)`
+    ///
+    /// 设置自动回收阈值。
+    /// 当垃圾计数超过此阈值时，会自动调用 `collect()`。
+    /// 传递 `None` 可禁用自动回收。
+    #[inline]
+    pub fn auto_reclaim_threshold(mut self, threshold: impl Into<Option<usize>>) -> Self {
+        self.auto_reclaim_threshold = threshold.into();
+        self
+    }
+
+    /// Set the cleanup interval for dead reader slots.
+    ///
+    /// Dead reader slots are cleaned up every N collection cycles to reduce overhead.
+    /// Set to `0` to disable periodic cleanup (not recommended).
+    ///
+    /// Default: `16`
+    ///
+    /// 设置死读者槽的清理间隔。
+    /// 死读者槽每 N 个回收周期清理一次，以减少开销。
+    /// 设置为 `0` 可禁用定期清理（不推荐）。
+    #[inline]
+    pub fn cleanup_interval(mut self, interval: usize) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+
+    /// Build the `EpochGcDomain` with the configured settings.
+    ///
+    /// Returns both the `GcHandle` and the `EpochGcDomain`.
+    ///
+    /// 使用配置的设置构建 `EpochGcDomain`。
+    /// 返回 `GcHandle` 和 `EpochGcDomain`。
+    #[inline]
+    pub fn build(self) -> (GcHandle, EpochGcDomain) {
+        let shared = Arc::new(SharedState {
+            global_epoch: AtomicUsize::new(0),
+            readers: Mutex::new(Vec::new()),
+        });
+
+        let gc = GcHandle {
+            shared: shared.clone(),
+            local_garbage: VecDeque::new(),
+            local_garbage_count: 0,
+            auto_reclaim_threshold: self.auto_reclaim_threshold,
+            collection_counter: 0,
+            cleanup_interval: self.cleanup_interval,
+        };
+
+        let domain = EpochGcDomain { shared };
+
+        (gc, domain)
+    }
+}
+
+impl Default for EpochGcDomainBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An epoch-based garbage collection domain.
 ///
 /// `EpochGcDomain` is the entry point for creating an epoch-based GC system.
@@ -379,30 +484,25 @@ impl EpochGcDomain {
     /// 返回 GcHandle 和 EpochGcDomain。
     #[inline]
     pub fn new() -> (GcHandle, Self) {
-        Self::new_with_threshold(Some(AUTO_RECLAIM_THRESHOLD))
+        Self::builder().build()
     }
 
-    /// Create a new epoch GC domain with a custom auto-reclaim threshold.
-    /// Returns both the GcHandle and the EpochGcDomain.
-    /// 创建一个新的 epoch GC 域，带有自定义自动回收阈值。
-    /// 返回 GcHandle 和 EpochGcDomain。
+    /// Create a builder for configuring the epoch GC domain.
+    /// 
+    /// # Example
+    /// ```
+    /// use swmr_epoch::EpochGcDomain;
+    /// 
+    /// let (gc, domain) = EpochGcDomain::builder()
+    ///     .auto_reclaim_threshold(128)
+    ///     .cleanup_interval(32)
+    ///     .build();
+    /// ```
+    /// 
+    /// 创建一个用于配置 epoch GC 域的构建器。
     #[inline]
-    pub fn new_with_threshold(threshold: Option<usize>) -> (GcHandle, Self) {
-        let shared = Arc::new(SharedState {
-            global_epoch: AtomicUsize::new(0),
-            readers: Mutex::new(Vec::new()),
-        });
-
-        let gc = GcHandle {
-            shared: shared.clone(),
-            local_garbage: VecDeque::new(),
-            local_garbage_count: 0,
-            auto_reclaim_threshold: threshold,
-        };
-
-        let domain = EpochGcDomain { shared };
-
-        (gc, domain)
+    pub fn builder() -> EpochGcDomainBuilder {
+        EpochGcDomainBuilder::new()
     }
 
     /// Register a new reader for the current thread.
