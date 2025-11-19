@@ -244,7 +244,7 @@ impl GcHandle {
         let mut dead_count = 0;
         
         for arc_slot in shared_readers.iter() {
-            let epoch = arc_slot.active_epoch.load(Ordering::SeqCst);
+            let epoch = arc_slot.active_epoch.load(Ordering::Acquire);
             if epoch != INACTIVE_EPOCH {
                 min_active_epoch = min_active_epoch.min(epoch);
             } else if should_cleanup && Arc::strong_count(arc_slot) == 1 {
@@ -258,18 +258,11 @@ impl GcHandle {
             shared_readers.retain(|arc_slot| Arc::strong_count(arc_slot) > 1);
         }
         
-        // Explicitly drop the lock before proceeding to garbage collection
         drop(shared_readers);
 
-        // 回收垃圾：只回收严格早于 min_active_epoch 的 epoch 的垃圾
-        // Reclaim garbage: only reclaim from epochs strictly before min_active_epoch
         if min_active_epoch == new_epoch {
-            // 没有活跃读者，回收所有垃圾
-            // No active readers, reclaim all garbage
             self.local_garbage.clear();
         } else if min_active_epoch > 0 {
-            // 回收 epoch < min_active_epoch 的垃圾
-            // Reclaim garbage from epochs < min_active_epoch
             let safe_to_reclaim_epoch = min_active_epoch - 1;
             while let Some((epoch, _)) = self.local_garbage.front() {
                 if *epoch > safe_to_reclaim_epoch {
@@ -278,8 +271,6 @@ impl GcHandle {
                 self.local_garbage.pop_front();
             }
         }
-        // 如果 min_active_epoch == 0，不回收任何垃圾
-        // If min_active_epoch == 0, don't reclaim any garbage
 
         self.local_garbage_count = self.local_garbage.iter()
             .map(|(_, bag)| bag.len())
@@ -592,21 +583,13 @@ pub struct PinGuard<'a> {
 impl<'a> Clone for PinGuard<'a> {
     /// Clone this guard to create a nested pin.
     ///
-    /// This is an internal implementation of the `Clone` trait that enables nested pinning.
     /// Cloning increments the pin count, and the thread remains pinned until all cloned guards
     /// are dropped. This allows multiple scopes to hold pins simultaneously.
     ///
-    /// **Note**: This method is automatically invoked when cloning a `PinGuard`.
-    /// Users can clone a guard directly: `let guard2 = guard1.clone();`
-    ///
     /// 克隆此守卫以创建嵌套 pin。
     ///
-    /// 这是 `Clone` trait 的内部实现，启用嵌套 pinning。
     /// 克隆会增加 pin 计数，线程保持被钉住直到所有克隆的守卫被 drop。
     /// 这允许多个作用域同时持有 pin。
-    ///
-    /// **注意**：当克隆 `PinGuard` 时会自动调用此方法。
-    /// 用户可以直接克隆守卫：`let guard2 = guard1.clone();`
     #[inline]
     fn clone(&self) -> Self {
         let pin_count = self.reader.pin_count.get();
@@ -743,11 +726,16 @@ impl<T: 'static> EpochPtr<T> {
     /// The old value will be reclaimed once it is safe to do so (i.e., after
     /// all readers have moved past the epoch in which it was retired).
     ///
+    /// **Automatic Reclamation**: This operation may trigger automatic garbage collection
+    /// if the garbage threshold is exceeded.
+    ///
     /// 写入者 store：安全地更新值并退休旧值。
     /// 此方法原子地用新指针替换当前指针，
     /// 并将旧值入队进行垃圾回收。
     /// 旧值将在安全时被回收（即，在所有读者都已超过
     /// 退休该值的纪元之后）。
+    ///
+    /// **自动回收**：如果超过垃圾阈值，此操作可能会触发自动垃圾回收。
     #[inline]
     pub fn store(&self, data: T, gc: &mut GcHandle) {
         let new_ptr = Box::into_raw(Box::new(data));
