@@ -1,6 +1,6 @@
 //! # Epoch-Based Garbage Collection
 //!
-//! This module provides a lock-free, single-writer, multi-reader garbage collection system
+//! This module provides a minimal-locking, single-writer, multi-reader garbage collection system
 //! based on epoch-based reclamation. It is designed for scenarios where:
 //!
 //! - One thread (the writer) owns and updates shared data structures.
@@ -104,11 +104,13 @@ impl Drop for RetiredObject {
 }
 
 #[derive(Debug)]
+#[repr(align(64))]
 struct ReaderSlot {
     active_epoch: AtomicUsize,
 }
 
 #[derive(Debug)]
+#[repr(align(64))]
 struct SharedState {
     global_epoch: AtomicUsize,
     readers: Mutex<Vec<Arc<ReaderSlot>>>,
@@ -229,7 +231,7 @@ impl GcHandle {
     /// 可以定期调用或在重大更新后调用。
     /// 即使没有垃圾要回收也可以安全调用。
     pub fn collect(&mut self) {
-        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::Acquire) + 1;
+        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
         let mut min_active_epoch = new_epoch;
         self.collection_counter += 1;
@@ -242,7 +244,7 @@ impl GcHandle {
         let mut dead_count = 0;
         
         for arc_slot in shared_readers.iter() {
-            let epoch = arc_slot.active_epoch.load(Ordering::Acquire);
+            let epoch = arc_slot.active_epoch.load(Ordering::SeqCst);
             if epoch != INACTIVE_EPOCH {
                 min_active_epoch = min_active_epoch.min(epoch);
             } else if should_cleanup && Arc::strong_count(arc_slot) == 1 {

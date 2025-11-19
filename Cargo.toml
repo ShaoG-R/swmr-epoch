@@ -3,12 +3,12 @@ name = "swmr-epoch"
 version = "0.3.6"
 edition = "2024"
 authors = ["ShaoG <shaog.rs@gmail.com>"]
-description = "Lock-free single-writer multi-reader epoch-based garbage collection system with atomic pointers"
+description = "Single-writer multi-reader epoch-based garbage collection system with minimal locking"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ShaoG-R/swmr-epoch"
 homepage = "https://github.com/ShaoG-R/swmr-epoch"
 documentation = "https://docs.rs/swmr-epoch"
-keywords = ["epoch", "garbage-collection", "lock-free", "concurrent", "smr"]
+keywords = ["epoch", "garbage-collection", "concurrent", "smr", "atomic"]
 categories = ["concurrency", "memory-management", "data-structures"]
 
 [lints.rust]
