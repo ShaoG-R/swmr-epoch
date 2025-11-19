@@ -151,7 +151,7 @@ fn test_garbage_collection_trigger() {
     // 由于 AUTO_RECLAIM_THRESHOLD = 64，第 65 个退休会触发 collect
     // 在没有活跃读取者的情况下，垃圾应该被清空
     // 只需验证垃圾数量少于退休的数据数量
-    assert!(gc.local_garbage.len() < 70);
+    assert!(gc.garbage.len() < 70);
 }
 
 /// 测试6: 活跃读取者保护垃圾
@@ -170,7 +170,7 @@ fn test_active_reader_protects_garbage() {
 
     // 由于读取者仍然活跃，垃圾不应该被完全清空
     // （至少应该保留一些垃圾）
-    assert!(gc.local_garbage.len() > 0);
+    assert!(gc.garbage.len() > 0);
 }
 
 /// 测试7: 读取者 drop 后垃圾被回收
@@ -188,14 +188,14 @@ fn test_garbage_reclaimed_after_reader_drop() {
         }
 
         // 垃圾应该被保留
-        assert!(gc.local_garbage.len() > 0);
+        assert!(gc.garbage.len() > 0);
     }
 
     // 读取者 drop 后，触发一次回收
     gc.collect();
 
     // 现在垃圾应该被清空
-    assert_eq!(gc.local_garbage.len(), 0);
+    assert_eq!(gc.garbage.len(), 0);
 }
 
 /// 测试8: 多个读取者的最小纪元计算
@@ -223,7 +223,7 @@ fn test_min_epoch_calculation_multiple_readers() {
     gc.collect();
 
     // 由于 reader1 仍在纪元 0，垃圾应该被保留
-    assert!(gc.local_garbage.len() > 0);
+    assert!(gc.garbage.len() > 0);
 }
 
 /// 测试9: 大量并发读取

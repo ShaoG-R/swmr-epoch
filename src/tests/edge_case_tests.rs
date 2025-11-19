@@ -13,7 +13,7 @@ fn test_empty_garbage_collection() {
     gc.collect();
 
     // 应该没有问题
-    assert_eq!(gc.local_garbage.len(), 0);
+    assert_eq!(gc.garbage.len(), 0);
 }
 
 /// 测试2: 单个数据的退休和回收
@@ -63,7 +63,7 @@ fn test_exceed_reclaim_threshold() {
 
     // 由于没有活跃读取者，垃圾会被回收
     // 但可能不会完全清空，只需验证数量少于退休的数据
-    assert!(gc.local_garbage.len() < 100);
+    assert!(gc.garbage.len() < 100);
 }
 
 /// 测试5: 零大小类型
@@ -321,12 +321,12 @@ fn test_garbage_protection_across_epochs() {
         }
 
         // 垃圾应该被保留
-        assert!(gc.local_garbage.len() > 0);
+        assert!(gc.garbage.len() > 0);
     }
 
     // 第二轮：读取者不活跃，垃圾应该被回收
     gc.collect();
-    assert_eq!(gc.local_garbage.len(), 0);
+    assert_eq!(gc.garbage.len(), 0);
 }
 
 /// 测试19: 动态读取者注册

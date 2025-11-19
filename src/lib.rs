@@ -116,6 +116,121 @@ struct SharedState {
     readers: Mutex<Vec<Arc<ReaderSlot>>>,
 }
 
+/// Manages retired objects and their reclamation.
+///
+/// This struct encapsulates the logic for:
+/// - Storing retired objects in epoch-ordered bags.
+/// - Managing a pool of vectors to reduce allocation overhead.
+/// - Reclaiming objects when they are safe to delete.
+///
+/// 管理已退休对象及其回收。
+///
+/// 此结构体封装了以下逻辑：
+/// - 将已退休对象存储在按纪元排序的袋子中。
+/// - 管理向量池以减少分配开销。
+/// - 当对象可以安全删除时进行回收。
+struct GarbageSet {
+    /// Queue of garbage bags, ordered by epoch.
+    /// Each element is (epoch, bag_of_nodes).
+    queue: VecDeque<(usize, Vec<RetiredNode>)>,
+    /// Pool of empty vectors to reduce allocation.
+    pool: Vec<Vec<RetiredNode>>,
+    /// Total number of retired nodes in the queue.
+    count: usize,
+}
+
+impl GarbageSet {
+    /// Create a new empty garbage set.
+    /// 创建一个新的空垃圾集合。
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            pool: Vec::new(),
+            count: 0,
+        }
+    }
+
+    /// Get the total number of retired objects.
+    /// 获取已退休对象的总数。
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Add a retired node to the set for the current epoch.
+    ///
+    /// If the last bag belongs to the current epoch, the node is appended to it.
+    /// Otherwise, a new bag is created (possibly reused from the pool).
+    ///
+    /// 将已退休节点添加到当前纪元的集合中。
+    ///
+    /// 如果最后一个袋子属于当前纪元，则将节点追加到其中。
+    /// 否则，创建一个新袋子（可能从池中复用）。
+    fn add(&mut self, node: RetiredNode, current_epoch: usize) {
+        // Check if we can append to the last bag
+        let append_to_last = if let Some((last_epoch, _)) = self.queue.back() {
+            *last_epoch == current_epoch
+        } else {
+            false
+        };
+
+        if append_to_last {
+            // Safe to unwrap because we checked back() above
+            self.queue
+                .back_mut()
+                .unwrap()
+                .1
+                .push(node);
+        } else {
+            // Reuse a vector from the pool if available, or create a new one
+            let mut bag = self.pool.pop().unwrap_or_else(|| Vec::with_capacity(16));
+            bag.push(node);
+            self.queue.push_back((current_epoch, bag));
+        }
+
+        self.count += 1;
+    }
+
+    /// Reclaim garbage that is safe to delete.
+    ///
+    /// Garbage from epochs older than `min_active_epoch` (or `min_active_epoch - 1` depending on logic)
+    /// is cleared and the vectors are returned to the pool.
+    ///
+    /// 回收可以安全删除的垃圾。
+    ///
+    /// 来自比 `min_active_epoch`（或 `min_active_epoch - 1`，取决于逻辑）更旧的纪元的垃圾
+    /// 被清除，向量被归还到池中。
+    fn collect(&mut self, min_active_epoch: usize, current_epoch: usize) {
+        // Helper closure to recycle a bag
+        fn recycle_bag(mut bag: Vec<RetiredNode>, pool: &mut Vec<Vec<RetiredNode>>) {
+            bag.clear(); // Drops all retired objects inside
+            pool.push(bag);
+        }
+
+        if min_active_epoch == current_epoch {
+            // Reclaim everything
+            for (_, bag) in self.queue.drain(..) {
+                recycle_bag(bag, &mut self.pool);
+            }
+        } else if min_active_epoch > 0 {
+            let safe_to_reclaim_epoch = min_active_epoch - 1;
+            while let Some((epoch, _)) = self.queue.front() {
+                if *epoch > safe_to_reclaim_epoch {
+                    break;
+                }
+                // Pop and recycle
+                if let Some((_, bag)) = self.queue.pop_front() {
+                    recycle_bag(bag, &mut self.pool);
+                }
+            }
+        }
+
+        self.count = self.queue.iter()
+            .map(|(_, bag)| bag.len())
+            .sum();
+    }
+}
+
 /// The unique garbage collector handle for an epoch GC domain.
 ///
 /// There should be exactly one `GcHandle` per `EpochGcDomain`, owned by the writer thread.
@@ -135,8 +250,7 @@ struct SharedState {
 /// **线程安全性**：`GcHandle` 不是线程安全的，必须由单个线程持有。
 pub struct GcHandle {
     shared: Arc<SharedState>,
-    local_garbage: VecDeque<(usize, Vec<RetiredNode>)>,
-    local_garbage_count: usize,
+    garbage: GarbageSet,
     auto_reclaim_threshold: Option<usize>,
     collection_counter: usize,
     cleanup_interval: usize,
@@ -145,7 +259,7 @@ pub struct GcHandle {
 impl GcHandle {
     #[inline]
     fn total_garbage_count(&self) -> usize {
-        self.local_garbage_count
+        self.garbage.len()
     }
 
     /// Retire (defer deletion) of a value.
@@ -175,25 +289,7 @@ impl GcHandle {
     pub(crate) fn retire<T: 'static>(&mut self, data: Box<T>) {
         let current_epoch = self.shared.global_epoch.load(Ordering::Relaxed);
 
-        if let Some((last_epoch, bag)) = self.local_garbage.back_mut() {
-            if *last_epoch == current_epoch {
-                bag.push(RetiredObject::new(data));
-            } else {
-                debug_assert!(
-                    *last_epoch < current_epoch,
-                    "last_epoch: {}, current_epoch: {}",
-                    last_epoch,
-                    current_epoch
-                );
-                self.local_garbage
-                    .push_back((current_epoch, vec![RetiredObject::new(data)]));
-            }
-        } else {
-            self.local_garbage
-                .push_back((current_epoch, vec![RetiredObject::new(data)]));
-        }
-
-        self.local_garbage_count += 1;
+        self.garbage.add(RetiredObject::new(data), current_epoch);
 
         if let Some(threshold) = self.auto_reclaim_threshold {
             if self.total_garbage_count() > threshold {
@@ -260,21 +356,7 @@ impl GcHandle {
         
         drop(shared_readers);
 
-        if min_active_epoch == new_epoch {
-            self.local_garbage.clear();
-        } else if min_active_epoch > 0 {
-            let safe_to_reclaim_epoch = min_active_epoch - 1;
-            while let Some((epoch, _)) = self.local_garbage.front() {
-                if *epoch > safe_to_reclaim_epoch {
-                    break;
-                }
-                self.local_garbage.pop_front();
-            }
-        }
-
-        self.local_garbage_count = self.local_garbage.iter()
-            .map(|(_, bag)| bag.len())
-            .sum();
+        self.garbage.collect(min_active_epoch, new_epoch);
     }
 }
 
@@ -435,8 +517,7 @@ impl EpochGcDomainBuilder {
 
         let gc = GcHandle {
             shared: shared.clone(),
-            local_garbage: VecDeque::new(),
-            local_garbage_count: 0,
+            garbage: GarbageSet::new(),
             auto_reclaim_threshold: self.auto_reclaim_threshold,
             collection_counter: 0,
             cleanup_interval: self.cleanup_interval,
@@ -746,6 +827,13 @@ impl<T: 'static> EpochPtr<T> {
                 gc.retire(Box::from_raw(old_ptr));
             }
         }
+    }
+}
+
+impl<T> std::fmt::Debug for EpochPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ptr = self.ptr.load(Ordering::Relaxed);
+        f.debug_tuple("EpochPtr").field(&ptr).finish()
     }
 }
 

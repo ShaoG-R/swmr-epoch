@@ -287,7 +287,7 @@ fn test_large_garbage_safe_reclamation() {
 
     // 由于没有活跃读取者，垃圾会被回收
     // 但可能不会完全清空，只需验证数量少于退休的数据
-    assert!(gc.local_garbage.len() < 1000);
+    assert!(gc.garbage.len() < 1000);
 }
 
 /// 测试14: 复杂类型的生命周期管理
@@ -393,12 +393,12 @@ fn test_writer_garbage_management() {
         }
 
         // 垃圾应该被保留
-        assert!(gc.local_garbage.len() > 0);
+        assert!(gc.garbage.len() > 0);
     }
 
     // 第二轮：读取者不活跃，垃圾应该被回收
     gc.collect();
-    assert_eq!(gc.local_garbage.len(), 0);
+    assert_eq!(gc.garbage.len(), 0);
 }
 
 /// 测试19: 多个读取者的垃圾保护
@@ -421,7 +421,7 @@ fn test_multiple_readers_garbage_protection() {
     }
 
     // 由于所有读取者都活跃，垃圾应该被保留
-    assert!(gc.local_garbage.len() > 0);
+    assert!(gc.garbage.len() > 0);
 }
 
 /// 测试20: 完整的生命周期场景
