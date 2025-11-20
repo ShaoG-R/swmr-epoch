@@ -63,17 +63,41 @@ use antidote::Mutex;
 
 use std::collections::VecDeque;
 
+/// Default threshold for automatic garbage reclamation (count of retired nodes).
+/// 自动垃圾回收的默认阈值（已退休节点的数量）。
 const AUTO_RECLAIM_THRESHOLD: usize = 64;
+
+/// Default interval for cleaning up dead reader slots (in collection cycles).
+/// 清理死读者槽的默认间隔（以回收周期为单位）。
 const DEFAULT_CLEANUP_INTERVAL: usize = 16;
+
+/// Represents a reader that is not currently pinned to any epoch.
+/// 表示当前未被钉住到任何纪元的读者。
 const INACTIVE_EPOCH: usize = usize::MAX;
 
+/// Alias for the retired object type used in garbage lists.
+/// 垃圾列表中使用的已退休对象类型的别名。
 type RetiredNode = RetiredObject;
 
+/// An object that has been retired (removed from shared view) but not yet deleted.
+/// It stores the raw pointer and a destructor function to safely drop the concrete type.
+///
+/// 一个已被退休（从共享视图中移除）但尚未删除的对象。
+/// 它存储原始指针和析构函数，以安全地 drop 具体类型。
 struct RetiredObject {
+    /// The raw pointer to the data.
+    /// 数据的原始指针。
     ptr: *mut (),
+    /// Function pointer to the type-specific destructor.
+    /// 类型特定析构函数的函数指针。
     dtor: unsafe fn(*mut ()),
 }
 
+/// Generic destructor for retired objects.
+/// Converts the raw pointer back to Box<T> and drops it.
+///
+/// 已退休对象的通用析构函数。
+/// 将原始指针转换回 Box<T> 并将其 drop。
 #[inline(always)]
 unsafe fn drop_value<T>(ptr: *mut ()) {
     let ptr = ptr as *mut T;
@@ -83,6 +107,8 @@ unsafe fn drop_value<T>(ptr: *mut ()) {
 }
 
 impl RetiredObject {
+    /// Create a new retired object from a Box<T>.
+    /// 从 Box<T> 创建一个新的已退休对象。
     #[inline(always)]
     fn new<T: 'static>(value: Box<T>) -> Self {
         let ptr = Box::into_raw(value) as *mut ();
@@ -94,6 +120,8 @@ impl RetiredObject {
 }
 
 impl Drop for RetiredObject {
+    /// Executes the type-erased destructor.
+    /// 执行类型擦除的析构函数。
     #[inline(always)]
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -105,17 +133,37 @@ impl Drop for RetiredObject {
     }
 }
 
+/// A slot allocated for a reader thread to record its active epoch.
+///
+/// Cache-aligned to prevent false sharing between readers.
+///
+/// 为读者线程分配的槽，用于记录其活跃纪元。
+/// 缓存对齐以防止读者之间的伪共享。
 #[derive(Debug)]
 #[repr(align(64))]
 struct ReaderSlot {
+    /// The epoch currently being accessed by the reader, or INACTIVE_EPOCH.
+    /// 读者当前访问的纪元，或 INACTIVE_EPOCH。
     active_epoch: AtomicUsize,
 }
 
+/// Global shared state for the epoch GC domain.
+///
+/// Contains the global epoch, the minimum active epoch, and the list of reader slots.
+///
+/// epoch GC 域的全局共享状态。
+/// 包含全局纪元、最小活跃纪元和读者槽列表。
 #[derive(Debug)]
 #[repr(align(64))]
 struct SharedState {
+    /// The global monotonic epoch counter.
+    /// 全局单调纪元计数器。
     global_epoch: AtomicUsize,
+    /// The minimum epoch among all active readers (cached for performance).
+    /// 所有活跃读者中的最小纪元（为性能而缓存）。
     min_active_epoch: AtomicUsize,
+    /// List of all registered reader slots. Protected by a Mutex.
+    /// 所有注册读者槽的列表。由 Mutex 保护。
     readers: Mutex<Vec<Arc<ReaderSlot>>>,
 }
 
