@@ -55,9 +55,11 @@ use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 #[cfg(loom)]
-use loom::sync::{Arc, Mutex};
+use loom::sync::Arc;
 #[cfg(not(loom))]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use antidote::Mutex;
 
 use std::collections::VecDeque;
 
@@ -176,11 +178,7 @@ impl GarbageSet {
 
         if append_to_last {
             // Safe to unwrap because we checked back() above
-            self.queue
-                .back_mut()
-                .unwrap()
-                .1
-                .push(node);
+            self.queue.back_mut().unwrap().1.push(node);
         } else {
             // Reuse a vector from the pool if available, or create a new one
             let mut bag = self.pool.pop().unwrap_or_else(|| Vec::with_capacity(16));
@@ -225,9 +223,7 @@ impl GarbageSet {
             }
         }
 
-        self.count = self.queue.iter()
-            .map(|(_, bag)| bag.len())
-            .sum();
+        self.count = self.queue.iter().map(|(_, bag)| bag.len()).sum();
     }
 }
 
@@ -331,14 +327,14 @@ impl GcHandle {
 
         let mut min_active_epoch = new_epoch;
         self.collection_counter += 1;
-        
-        let should_cleanup = self.cleanup_interval > 0 && self.collection_counter % self.cleanup_interval == 0;
 
-        let mut shared_readers = self.shared.readers.lock()
-            .expect("Failed to acquire readers lock in collect: mutex poisoned");
-        
+        let should_cleanup =
+            self.cleanup_interval > 0 && self.collection_counter % self.cleanup_interval == 0;
+
+        let mut shared_readers = self.shared.readers.lock();
+
         let mut dead_count = 0;
-        
+
         for arc_slot in shared_readers.iter() {
             let epoch = arc_slot.active_epoch.load(Ordering::Acquire);
             if epoch != INACTIVE_EPOCH {
@@ -353,7 +349,7 @@ impl GcHandle {
             // Keep only slots that have external references (strong_count > 1)
             shared_readers.retain(|arc_slot| Arc::strong_count(arc_slot) > 1);
         }
-        
+
         drop(shared_readers);
 
         self.garbage.collect(min_active_epoch, new_epoch);
@@ -585,17 +581,17 @@ impl EpochGcDomain {
     }
 
     /// Create a builder for configuring the epoch GC domain.
-    /// 
+    ///
     /// # Example
     /// ```
     /// use swmr_epoch::EpochGcDomain;
-    /// 
+    ///
     /// let (gc, domain) = EpochGcDomain::builder()
     ///     .auto_reclaim_threshold(128)
     ///     .cleanup_interval(32)
     ///     .build();
     /// ```
-    /// 
+    ///
     /// 创建一个用于配置 epoch GC 域的构建器。
     #[inline]
     pub fn builder() -> EpochGcDomainBuilder {
@@ -618,9 +614,7 @@ impl EpochGcDomain {
         });
 
         // Register the reader immediately in the shared readers list
-        self.shared.readers.lock()
-            .expect("Failed to acquire readers lock in register_reader: mutex poisoned")
-            .push(Arc::clone(&slot));
+        self.shared.readers.lock().push(Arc::clone(&slot));
 
         LocalEpoch {
             slot,
