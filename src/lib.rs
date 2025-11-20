@@ -115,6 +115,7 @@ struct ReaderSlot {
 #[repr(align(64))]
 struct SharedState {
     global_epoch: AtomicUsize,
+    min_active_epoch: AtomicUsize,
     readers: Mutex<Vec<Arc<ReaderSlot>>>,
 }
 
@@ -323,7 +324,7 @@ impl GcHandle {
     /// 可以定期调用或在重大更新后调用。
     /// 即使没有垃圾要回收也可以安全调用。
     pub fn collect(&mut self) {
-        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_epoch = self.shared.global_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         let mut min_active_epoch = new_epoch;
         self.collection_counter += 1;
@@ -352,6 +353,9 @@ impl GcHandle {
 
         drop(shared_readers);
 
+        self.shared
+            .min_active_epoch
+            .store(min_active_epoch, Ordering::Release);
         self.garbage.collect(min_active_epoch, new_epoch);
     }
 }
@@ -421,10 +425,18 @@ impl LocalEpoch {
         let pin_count = self.pin_count.get();
 
         if pin_count == 0 {
-            let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
-            self.slot
-                .active_epoch
-                .store(current_epoch, Ordering::Release);
+            loop {
+                let current_epoch = self.shared.global_epoch.load(Ordering::Acquire);
+                self.slot
+                    .active_epoch
+                    .store(current_epoch, Ordering::Release);
+
+                let min_active = self.shared.min_active_epoch.load(Ordering::Acquire);
+                if current_epoch >= min_active {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
         }
 
         self.pin_count.set(pin_count + 1);
@@ -508,6 +520,7 @@ impl EpochGcDomainBuilder {
     pub fn build(self) -> (GcHandle, EpochGcDomain) {
         let shared = Arc::new(SharedState {
             global_epoch: AtomicUsize::new(0),
+            min_active_epoch: AtomicUsize::new(0),
             readers: Mutex::new(Vec::new()),
         });
 
