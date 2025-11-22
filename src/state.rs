@@ -1,4 +1,4 @@
-use crate::sync::{AtomicUsize, Mutex, Arc};
+use crate::sync::{Arc, AtomicUsize, Mutex};
 use std::vec::Vec;
 
 /// Default threshold for automatic garbage reclamation (count of retired nodes).

@@ -44,12 +44,12 @@
 //! gc.collect();  // Reclaim garbage from old epochs
 //! ```
 
-mod sync;
-pub(crate) mod state;
-pub(crate) mod garbage;
-pub(crate) mod reader;
 pub(crate) mod domain;
+pub(crate) mod garbage;
 pub(crate) mod ptr;
+pub(crate) mod reader;
+pub(crate) mod state;
+mod sync;
 
 #[cfg(test)]
 mod tests;

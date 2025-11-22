@@ -1,7 +1,7 @@
-use crate::sync::{Arc, AtomicUsize, Mutex};
-use crate::state::{SharedState, AUTO_RECLAIM_THRESHOLD, DEFAULT_CLEANUP_INTERVAL};
-use crate::garbage::{GcHandle, GarbageSet};
+use crate::garbage::{GarbageSet, GcHandle};
 use crate::reader::LocalEpoch;
+use crate::state::{AUTO_RECLAIM_THRESHOLD, DEFAULT_CLEANUP_INTERVAL, SharedState};
+use crate::sync::{Arc, AtomicUsize, Mutex};
 use std::vec::Vec;
 
 /// Builder for configuring an `EpochGcDomain`.

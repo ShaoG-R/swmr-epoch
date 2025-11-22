@@ -1,8 +1,8 @@
+use crate::state::{INACTIVE_EPOCH, SharedState};
 use crate::sync::{Arc, Ordering};
-use crate::state::{SharedState, INACTIVE_EPOCH};
+use std::boxed::Box;
 use std::collections::VecDeque;
 use std::vec::Vec;
-use std::boxed::Box;
 
 /// Alias for the retired object type used in garbage lists.
 /// 垃圾列表中使用的已退休对象类型的别名。

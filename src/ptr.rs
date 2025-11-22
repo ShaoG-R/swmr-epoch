@@ -1,6 +1,6 @@
-use crate::sync::{AtomicPtr, Ordering};
-use crate::reader::PinGuard;
 use crate::garbage::GcHandle;
+use crate::reader::PinGuard;
+use crate::sync::{AtomicPtr, Ordering};
 use std::boxed::Box;
 
 /// An epoch-protected shared pointer for safe concurrent access.

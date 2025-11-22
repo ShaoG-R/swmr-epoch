@@ -11,13 +11,6 @@ documentation = "https://docs.rs/swmr-epoch"
 keywords = ["epoch", "garbage-collection", "concurrent", "smr", "atomic"]
 categories = ["concurrency", "memory-management", "data-structures"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
-
-[features]
-# Enable loom for concurrency testing
-loom = ["dep:loom"]
-
 [dependencies]
 antidote = "1.0.0"
 loom = { version = "0.7", optional = true }
@@ -25,6 +18,9 @@ loom = { version = "0.7", optional = true }
 [dev-dependencies]
 crossbeam-epoch = "0.9"
 criterion = { version = "0.7", features = ["html_reports"] }
+
+[features]
+loom = ["dep:loom"]
 
 [[bench]]
 name = "epoch_comparison"

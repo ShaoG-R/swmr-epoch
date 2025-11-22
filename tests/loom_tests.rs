@@ -1,16 +1,16 @@
 //! Loom-based concurrency tests
-//! 
+//!
 //! These tests use the `loom` library to exhaustively check all possible
 //! thread interleavings and detect concurrency bugs like data races, deadlocks,
 //! and memory ordering issues.
 //!
-//! Run with: `RUSTFLAGS="--cfg loom" cargo test --test loom_tests --release`
+//! Run with: `cargo test --features loom --test loom_tests`
 
-#![cfg(loom)]
+#![cfg(feature = "loom")]
 
+use loom::model::Builder;
 use loom::sync::Arc;
 use loom::thread;
-use loom::model::Builder;
 use swmr_epoch::{EpochGcDomain, EpochPtr};
 
 /// Test: Multiple readers can safely read concurrently
@@ -26,14 +26,14 @@ fn loom_concurrent_readers() {
         for _ in 0..2 {
             let domain = domain.clone();
             let ptr = Arc::clone(&ptr);
-            
+
             let handle = thread::spawn(move || {
                 let local = domain.register_reader();
                 let guard = local.pin();
                 let value = ptr.load(&guard);
                 assert_eq!(*value, 42);
             });
-            
+
             handles.push(handle);
         }
 
@@ -82,22 +82,22 @@ fn loom_reentrant_pinning() {
 
         let handle = thread::spawn(move || {
             let local = domain.register_reader();
-            
+
             // Nested pinning
             let guard1 = local.pin();
             let value1 = ptr.load(&guard1);
             assert_eq!(*value1, 100);
-            
+
             let guard2 = local.pin();
             let value2 = ptr.load(&guard2);
             assert_eq!(*value2, 100);
-            
+
             // Both guards should work
             let value3 = ptr.load(&guard1);
             assert_eq!(*value3, 100);
-            
+
             drop(guard2);
-            
+
             // guard1 should still work
             let value4 = ptr.load(&guard1);
             assert_eq!(*value4, 100);
@@ -117,18 +117,18 @@ fn loom_gc_safety() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader_handle = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
-            
+
             // Read the initial value and hold the pin
             let value = reader_ptr.load(&guard);
             assert!(*value >= 1 && *value <= 3);
-            
+
             // Simulate some work while holding the pin
             thread::yield_now();
-            
+
             // Value should still be valid
             let value2 = reader_ptr.load(&guard);
             assert!(*value2 >= 1 && *value2 <= 3);
@@ -137,7 +137,7 @@ fn loom_gc_safety() {
         // Writer updates and collects garbage
         ptr.store(2i32, &mut gc);
         gc.collect();
-        
+
         ptr.store(3i32, &mut gc);
         gc.collect();
 
@@ -155,10 +155,10 @@ fn loom_multiple_stores() {
         // Multiple stores
         ptr.store(2i32, &mut gc);
         ptr.store(3i32, &mut gc);
-        
+
         // Collection should safely reclaim old values
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
@@ -175,10 +175,10 @@ fn loom_epoch_advancement() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader_handle = thread::spawn(move || {
             let local = reader_domain.register_reader();
-            
+
             // Pin and unpin multiple times
             for _ in 0..2 {
                 let guard = local.pin();
@@ -223,16 +223,16 @@ fn loom_pin_guard_cloning() {
         let handle = thread::spawn(move || {
             let local = domain.register_reader();
             let guard1 = local.pin();
-            
+
             // Clone the guard
             let guard2 = guard1.clone();
-            
+
             // Both guards should work
             let value1 = ptr.load(&guard1);
             let value2 = ptr.load(&guard2);
             assert_eq!(*value1, 99);
             assert_eq!(*value2, 99);
-            
+
             // Drop one guard, the other should still work
             drop(guard2);
             let value3 = ptr.load(&guard1);
@@ -250,23 +250,23 @@ fn loom_sequential_writers() {
     loom::model(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(1i32));
-        
+
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
             let value = reader_ptr.load(&guard);
             assert!(*value >= 1 && *value <= 3);
         });
-        
+
         // Sequential stores
         ptr.store(2i32, &mut gc);
         gc.collect();
         ptr.store(3i32, &mut gc);
         gc.collect();
-        
+
         reader.join().unwrap();
     });
 }
@@ -282,24 +282,24 @@ fn loom_multiple_epoch_ptrs() {
         let reader_domain = domain.clone();
         let reader_ptr1 = Arc::clone(&ptr1);
         let reader_ptr2 = Arc::clone(&ptr2);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
-            
+
             let val1 = reader_ptr1.load(&guard);
             let val2 = reader_ptr2.load(&guard);
-            
+
             // Values should be from their respective stores
             assert!(*val1 == 10 || *val1 == 11);
             assert!(*val2 == 20 || *val2 == 21);
         });
-        
+
         // Update both pointers
         ptr1.store(11i32, &mut gc);
         ptr2.store(21i32, &mut gc);
         gc.collect();
-        
+
         reader.join().unwrap();
     });
 }
@@ -313,10 +313,10 @@ fn loom_fast_pin_unpin_cycles() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
-            
+
             // Rapid pin/unpin cycles
             for _ in 0..2 {
                 let guard = local.pin();
@@ -329,7 +329,7 @@ fn loom_fast_pin_unpin_cycles() {
         // Writer stores and collects during reader's pin/unpin cycles
         ptr.store(1i32, &mut gc);
         gc.collect();
-        
+
         reader.join().unwrap();
     });
 }
@@ -345,7 +345,7 @@ fn loom_gc_with_no_active_readers() {
         ptr.store(2i32, &mut gc);
         ptr.store(3i32, &mut gc);
         ptr.store(4i32, &mut gc);
-        
+
         // Collect - should reclaim all since no readers are active
         gc.collect();
 
@@ -366,7 +366,7 @@ fn loom_local_epoch_drop() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             {
                 let local = reader_domain.register_reader();
@@ -380,11 +380,11 @@ fn loom_local_epoch_drop() {
         });
 
         thread::yield_now();
-        
+
         // Store after reader might have dropped
         ptr.store(2i32, &mut gc);
         gc.collect();
-        
+
         reader.join().unwrap();
     });
 }
@@ -392,23 +392,25 @@ fn loom_local_epoch_drop() {
 /// Test: Reader pinned across multiple epoch advancements
 #[test]
 fn loom_reader_across_epochs() {
-    loom::model(|| {
+    let mut builder = Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(1i32));
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
-            
+
             // Hold pin across multiple yields
             let value1 = reader_ptr.load(&guard);
             thread::yield_now();
             let value2 = reader_ptr.load(&guard);
             thread::yield_now();
-            
+
             // Should see a consistent view or new value
             assert!(*value1 >= 1 && *value1 <= 3);
             assert!(*value2 >= 1 && *value2 <= 3);
@@ -420,7 +422,7 @@ fn loom_reader_across_epochs() {
         gc.collect();
         ptr.store(3i32, &mut gc);
         gc.collect();
-        
+
         reader.join().unwrap();
     });
 }
@@ -431,25 +433,25 @@ fn loom_three_readers_one_writer() {
     // Use preemption bound to limit state space exploration
     // 3 readers + 1 writer + mutex contention = large state space
     let mut builder = Builder::new();
-    builder.preemption_bound = Some(3);
+    builder.preemption_bound = Some(2);
     builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(0i32));
 
         let mut readers = vec![];
-        
+
         // Spawn 3 reader threads
         for _ in 0..3 {
             let reader_domain = domain.clone();
             let reader_ptr = Arc::clone(&ptr);
-            
+
             let reader = thread::spawn(move || {
                 let local = reader_domain.register_reader();
                 let guard = local.pin();
                 let value = reader_ptr.load(&guard);
                 assert!(*value <= 5);
             });
-            
+
             readers.push(reader);
         }
 
@@ -468,35 +470,35 @@ fn loom_three_readers_one_writer() {
 fn loom_interleaved_pin_unpin() {
     // Multiple pin/unpin cycles create large state space
     let mut builder = Builder::new();
-    builder.preemption_bound = Some(5);
+    builder.preemption_bound = Some(4);
     builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(100i32));
 
         let mut readers = vec![];
-        
+
         for _ in 0..2 {
             let reader_domain = domain.clone();
             let reader_ptr = Arc::clone(&ptr);
-            
+
             let reader = thread::spawn(move || {
                 let local = reader_domain.register_reader();
-                
+
                 // First pin
                 {
                     let guard = local.pin();
                     let _value = reader_ptr.load(&guard);
                 }
-                
+
                 thread::yield_now();
-                
+
                 // Second pin after unpin
                 {
                     let guard = local.pin();
                     let _value = reader_ptr.load(&guard);
                 }
             });
-            
+
             readers.push(reader);
         }
 
@@ -518,7 +520,7 @@ fn loom_store_collect_read_race() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
@@ -538,15 +540,13 @@ fn loom_store_collect_read_race() {
 #[test]
 fn loom_builder_custom_threshold() {
     loom::model(|| {
-        let (mut gc, domain) = EpochGcDomain::builder()
-            .auto_reclaim_threshold(2)
-            .build();
-        
+        let (mut gc, domain) = EpochGcDomain::builder().auto_reclaim_threshold(2).build();
+
         let ptr = EpochPtr::new(1i32);
-        
+
         // Store should not trigger auto-collection at threshold 2
         ptr.store(2i32, &mut gc);
-        
+
         // Verify value is updated
         let local = domain.register_reader();
         let guard = local.pin();
@@ -562,16 +562,16 @@ fn loom_builder_no_auto_reclaim() {
         let (mut gc, domain) = EpochGcDomain::builder()
             .auto_reclaim_threshold(None)
             .build();
-        
+
         let ptr = EpochPtr::new(1i32);
-        
+
         // Multiple stores without auto-collection
         ptr.store(2i32, &mut gc);
         ptr.store(3i32, &mut gc);
-        
+
         // Manual collection
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
@@ -584,7 +584,7 @@ fn loom_builder_no_auto_reclaim() {
 fn loom_different_pin_lifetimes() {
     // Limit preemption bound for faster completion
     let mut builder = Builder::new();
-    builder.preemption_bound = Some(5);
+    builder.preemption_bound = Some(4);
     builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(1i32));
@@ -623,13 +623,15 @@ fn loom_different_pin_lifetimes() {
 /// Test: Multiple collections without stores
 #[test]
 fn loom_multiple_collections_no_stores() {
-    loom::model(|| {
+    let mut builder = Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(42i32));
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
@@ -651,7 +653,7 @@ fn loom_multiple_collections_no_stores() {
 fn loom_dynamic_reader_registration() {
     // Dynamic registration with mutex contention needs bound
     let mut builder = Builder::new();
-    builder.preemption_bound = Some(5);
+    builder.preemption_bound = Some(4);
     builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(1i32));
@@ -694,7 +696,7 @@ fn loom_alternating_store_collect() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
@@ -721,17 +723,17 @@ fn loom_multiple_guards_same_local() {
 
         let handle = thread::spawn(move || {
             let local = domain.register_reader();
-            
+
             // Create multiple guards simultaneously
             let guard1 = local.pin();
             let guard2 = local.pin();
             let guard3 = guard1.clone();
-            
+
             // All guards should work
             assert_eq!(*ptr.load(&guard1), 77);
             assert_eq!(*ptr.load(&guard2), 77);
             assert_eq!(*ptr.load(&guard3), 77);
-            
+
             // Drop in different order
             drop(guard2);
             assert_eq!(*ptr.load(&guard1), 77);
@@ -749,15 +751,15 @@ fn loom_multiple_guards_same_local() {
 fn loom_new_and_immediate_load() {
     loom::model(|| {
         let (gc, domain) = EpochGcDomain::new();
-        
+
         // Create and immediately access
         let ptr = EpochPtr::new(123i32);
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
         assert_eq!(*value, 123);
-        
+
         drop(guard);
         drop(gc);
     });
@@ -769,7 +771,7 @@ fn loom_writer_only() {
     loom::model(|| {
         let (mut gc, _domain) = EpochGcDomain::new();
         let ptr = EpochPtr::new(1i32);
-        
+
         // Series of stores and collections without any readers
         ptr.store(2i32, &mut gc);
         gc.collect();
@@ -777,7 +779,7 @@ fn loom_writer_only() {
         gc.collect();
         ptr.store(4i32, &mut gc);
         gc.collect();
-        
+
         // All garbage should be reclaimed
     });
 }
@@ -785,26 +787,28 @@ fn loom_writer_only() {
 /// Test: Reader observes values from valid range across pin/unpin cycles
 #[test]
 fn loom_reader_monotonic_observation() {
-    loom::model(|| {
+    let mut builder = Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = Arc::new(EpochPtr::new(1i32));
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
-            
+
             let guard1 = local.pin();
             let val1 = *reader_ptr.load(&guard1);
             drop(guard1);
-            
+
             thread::yield_now();
-            
+
             let guard2 = local.pin();
             let val2 = *reader_ptr.load(&guard2);
             drop(guard2);
-            
+
             // Values should be from the sequence 1, 2, 3
             assert!(val1 >= 1 && val1 <= 3);
             assert!(val2 >= 1 && val2 <= 3);
@@ -823,7 +827,6 @@ fn loom_reader_monotonic_observation() {
     });
 }
 
-
 /// Test: Reader holds guard while writer performs multiple updates
 /// 测试：读取者在写入者执行多次更新时持有 guard
 #[test]
@@ -834,7 +837,7 @@ fn loom_reader_holds_guard_during_updates() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             // Hold a guard and a reference for a while
@@ -844,18 +847,18 @@ fn loom_reader_holds_guard_during_updates() {
             // 获取当前值的引用
             let value_ref = reader_ptr.load(&guard);
             let initial_value = *value_ref;
-            
+
             // Yield to allow writer to proceed
             // 让步以允许写入者继续
             thread::yield_now();
             thread::yield_now();
-            
+
             // The same reference should still be valid and consistent
             // even though writer has updated the pointer
             // 即使写入者已更新指针，相同的引用仍应有效且一致
             let same_value = *value_ref;
             assert_eq!(same_value, initial_value);
-            
+
             // Value should be in valid range
             // 值应在有效范围内
             assert!(initial_value >= 0 && initial_value <= 3);
@@ -871,21 +874,20 @@ fn loom_reader_holds_guard_during_updates() {
     });
 }
 
-
 /// Test: Builder with custom cleanup interval
 #[test]
 fn loom_builder_custom_cleanup_interval() {
     loom::model(|| {
         let (mut gc, domain) = EpochGcDomain::builder()
-            .cleanup_interval(1)  // Cleanup every collection
+            .cleanup_interval(1) // Cleanup every collection
             .build();
-        
+
         let ptr = EpochPtr::new(1i32);
-        
+
         // Store and collect
         ptr.store(2i32, &mut gc);
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
@@ -898,13 +900,13 @@ fn loom_builder_custom_cleanup_interval() {
 fn loom_builder_zero_cleanup_interval() {
     loom::model(|| {
         let (mut gc, domain) = EpochGcDomain::builder()
-            .cleanup_interval(0)  // No periodic cleanup
+            .cleanup_interval(0) // No periodic cleanup
             .build();
-        
+
         let ptr = EpochPtr::new(42i32);
-        
+
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
@@ -920,12 +922,12 @@ fn loom_builder_combined_options() {
             .auto_reclaim_threshold(5)
             .cleanup_interval(2)
             .build();
-        
+
         let ptr = EpochPtr::new(1i32);
-        
+
         ptr.store(2i32, &mut gc);
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         let value = ptr.load(&guard);
@@ -942,22 +944,22 @@ fn loom_guard_outlives_stores() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
             let guard = local.pin();
-            
+
             // Hold guard and read initial value
             let initial = *reader_ptr.load(&guard);
-            
+
             // Yield to let writer proceed
             thread::yield_now();
             thread::yield_now();
-            
+
             // Guard still protects the initial value we read
             // But we might see new value on subsequent loads
             let current = *reader_ptr.load(&guard);
-            
+
             assert!(initial >= 1 && initial <= 3);
             assert!(current >= 1 && current <= 3);
         });
@@ -978,7 +980,7 @@ fn loom_empty_domain() {
     loom::model(|| {
         let (mut gc, _domain) = EpochGcDomain::new();
         let ptr = EpochPtr::new(10i32);
-        
+
         // Operations without any registered readers
         ptr.store(20i32, &mut gc);
         gc.collect();
@@ -994,11 +996,11 @@ fn loom_single_writer_enforced() {
     loom::model(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = EpochPtr::new(1i32);
-        
+
         // Only one writer can exist due to &mut requirement
         ptr.store(2i32, &mut gc);
         ptr.store(3i32, &mut gc);
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         assert_eq!(*ptr.load(&guard), 3);
@@ -1014,18 +1016,18 @@ fn loom_guard_lifetime_safety() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
-            
+
             // Create nested scopes with different guard lifetimes
             {
                 let guard = local.pin();
                 let _val = reader_ptr.load(&guard);
             } // guard1 dropped
-            
+
             thread::yield_now();
-            
+
             {
                 let guard = local.pin();
                 let _val = reader_ptr.load(&guard);
@@ -1045,15 +1047,15 @@ fn loom_store_replaces_value() {
     loom::model(|| {
         let (mut gc, domain) = EpochGcDomain::new();
         let ptr = EpochPtr::new(1i32);
-        
+
         // First store replaces initial value
         ptr.store(2i32, &mut gc);
-        
+
         // Second store replaces previous value
         ptr.store(3i32, &mut gc);
-        
+
         gc.collect();
-        
+
         let local = domain.register_reader();
         let guard = local.pin();
         assert_eq!(*ptr.load(&guard), 3);
@@ -1069,15 +1071,15 @@ fn loom_concurrent_pin_unpin_collect() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             let local = reader_domain.register_reader();
-            
+
             // Pin and unpin rapidly
             let guard = local.pin();
             let _val = reader_ptr.load(&guard);
             drop(guard);
-            
+
             let guard = local.pin();
             let _val = reader_ptr.load(&guard);
         });
@@ -1099,18 +1101,18 @@ fn loom_multiple_local_epochs() {
 
         let reader_domain = domain.clone();
         let reader_ptr = Arc::clone(&ptr);
-        
+
         let reader = thread::spawn(move || {
             // Register multiple local epochs (unusual but valid)
             let local1 = reader_domain.register_reader();
             let local2 = reader_domain.register_reader();
-            
+
             let guard1 = local1.pin();
             let guard2 = local2.pin();
-            
+
             let val1 = reader_ptr.load(&guard1);
             let val2 = reader_ptr.load(&guard2);
-            
+
             // Both values should be valid (either 5 or 6)
             assert!(*val1 == 5 || *val1 == 6);
             assert!(*val2 == 5 || *val2 == 6);

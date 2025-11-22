@@ -1,7 +1,5 @@
-use std::sync::atomic::AtomicUsize;
-
-use crate::sync::{Arc, Ordering, Cell};
-use crate::state::{SharedState, ReaderSlot, INACTIVE_EPOCH};
+use crate::state::{INACTIVE_EPOCH, ReaderSlot, SharedState};
+use crate::sync::{Arc, AtomicUsize, Cell, Ordering};
 
 /// A reader thread's local epoch state.
 ///
