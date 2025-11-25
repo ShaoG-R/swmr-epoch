@@ -22,6 +22,9 @@ struct RetiredObject {
     dtor: unsafe fn(*mut ()),
 }
 
+// Safety: RetiredObject is Send because we only access the pointer through dtor
+unsafe impl Send for RetiredObject {}
+
 /// Generic destructor for retired objects.
 /// Converts the raw pointer back to Box<T> and drops it.
 ///
